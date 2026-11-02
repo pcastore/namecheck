@@ -1,0 +1,23 @@
+name = "namecheck"
+main = "namecheck.js"
+compatibility_date = "2026-10-15"
+keep_vars = true
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "pca-images"
+database_id = "d6c6077e-8dbc-4f50-857b-d91e43e8f491"
+
+# အဟောင်း KV - /migrate-kv ပြီးတဲ့အထိ မဖျက်ပါနဲ့
+[[kv_namespaces]]
+binding = "STATE"
+id = "fee32ac4542e48529602373a8aaf8b7f"
+
+[placement]
+mode = "smart"
+
+[observability]
+enabled = true
