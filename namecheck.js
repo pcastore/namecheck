@@ -1,6 +1,6 @@
 // PCA Name Check Bot — Cloudflare Worker + Telegram
 // Games come live from the store's Firestore "games" collection, filtered with the same rules as the
-// store's own Name Check. Each game entry is checked through its OWN provider only (G2Bulk or FazerCards).
+// store's own Name Check. Each game entry is checked through its OWN provider only (G2Bulk).
 // Secrets: BOT_TOKEN, WEBHOOK_SECRET.
 // Optional: KV binding named STATE (remembers each chat's last game), secret FIREBASE_API_KEY.
 // Access control (optional variables, comma-separated IDs; send /id to the bot to get yours):
@@ -28,13 +28,11 @@
 //   /addalias, /seticon + /emojiid (premium emoji on buttons), /summary (daily report to the owner), /addcmd (your own commands).
 
 const G2 = "https://api.g2bulk.com/v1";
-const FAZER_URL = "https://fazercards-functions.pca-game-store.workers.dev/fazercard-validate";
 const FS_PROJECT = "pca-game-store";
 const FS_KEY = "AIzaSyA2mwdZ2tAoZ3_6HNl43fUSi9t_ZkRita4"; // public web key, same one the store page uses
 const FS_FIELDS = [
-  "name", "serverName", "order", "g2bulkCode", "fazercardCategoryId", "fazercardFields",
+  "name", "serverName", "order", "g2bulkCode",
   "serverIdRequired", "playerIdRequired", "fulfillProvider", "g2bulkVoucherCategory",
-  "fazercardGiftCategoryId", "fazercardServerMode", "fazercardServerOptions",
   "g2bulkServerMode", "g2bulkServerOptions",
 ];
 
@@ -98,6 +96,7 @@ const SETTINGS = {
   idprefix: ["Group မှာ ID(Server) ပုံစံ သို့ 'id' ရှေ့ခံမှ စစ်မလား (on = ရှေ့ခံလို၊ off = ID ပို့တာနဲ့ auto စစ်)", "off", "onoff", "/set idprefix on|off"],
   pricewatch: ["Price / Cost / USD rate ပြောင်းရင် Owner ကို table နဲ့ သတိပေး (cron ၅ မိနစ်)", "on", "onoff", "/set pricewatch on|off"],
   rich: ["Rich message (Bot API 10.3: table + ခလုတ်) သုံးမလား — ဈေးနှုန်းမှာ", "on", "onoff", "/set rich on|off (app ဗားရှင်းဟောင်းမှာ မမြင်ရရင် off)"],
+  richcard: ["Name စစ်ရလဒ်ကတ်ကို Table border (rich message) နဲ့ ပြမလား", "on", "onoff", "/set richcard on|off (ပြဿနာရှိရင် off)"],
   pay: ["Payment auto-reply (KPay/Wave ... မေးရင် ဖြေမလား)", "on", "onoff", "/set pay on|off"],
   dmopen: ["Customer တွေ DM မှာ Bot သုံးခွင့် (on = ရ၊ off = Owner ပဲ)", "on", "onoff", "/set dmopen on|off"],
   dmhours: ["DM ဖွင့်ချိန် (မြန်မာ နာရီ) ဥပမာ 9-22 — ပြင်ပရင် away စာပို့", "", "text", "ဥပမာ: /set dmhours 9-22 (ရှင်းရန် /set dmhours reset)"],
@@ -484,20 +483,20 @@ function fv(v) {
   return undefined;
 }
 
-// Same rules as the store's Name Check (ncCheckable): no vouchers, needs a Player ID, wired to G2Bulk or FazerCards.
+// Same rules as the store's Name Check (ncCheckable): no vouchers, needs a Player ID, wired to G2Bulk.
 // Games with a Server ID are checked with ID + Server; games without one (serverIdRequired === false) are checked
 // with the ID only. Games with a fixed server dropdown are checked after the game name is typed: the player taps the server (or types its name).
 function baseOk(g) {
   if (!g || !g.name) return false;
   if (["g2bulk_voucher", "fazercard_giftcard", "jcplays", "voucher_manual"].includes(g.fulfillProvider)) return false;
-  if (g.g2bulkVoucherCategory || g.fazercardGiftCategoryId) return false;
+  if (g.g2bulkVoucherCategory) return false;
   if (g.playerIdRequired === false) return false;
   if (/heartopia/i.test(g.name)) return false;
-  return !!(g.g2bulkCode || g.fazercardCategoryId);
+  return !!g.g2bulkCode;
 }
 function isDropdown(g) {
   const hasOpts = (m, o) => m === "select" && Array.isArray(o) && o.length;
-  return !!(hasOpts(g.fazercardServerMode, g.fazercardServerOptions) || hasOpts(g.g2bulkServerMode, g.g2bulkServerOptions));
+  return !!hasOpts(g.g2bulkServerMode, g.g2bulkServerOptions);
 }
 const checkable = (g) => baseOk(g) && !isDropdown(g);
 const idOnlyEntry = (g) => g.serverIdRequired === false;
@@ -521,7 +520,7 @@ async function loadGameDocs(env) {
     if (s && Array.isArray(s.docs) && Date.now() - s.t < GAMES_TTL_MS) { GDOCS = s; return s.docs; }
   }
   const docs = [];
-  for (const coll of GCOLL === "gamesPublic" ? ["gamesPublic", "games"] : ["games", "gamesPublic"]) {
+  for (const coll of GCOLL === "games" ? ["games", "gamesPublic"] : ["gamesPublic", "games"]) {
     let token = "";
     for (let i = 0; i < 10; i++) {
       const qs = new URLSearchParams({ pageSize: "300", key: env.FIREBASE_API_KEY || FS_KEY });
@@ -694,27 +693,6 @@ async function g2Check(game, id, server) {
   return { outcome: "unknown", why: `HTTP ${res.status}` };
 }
 
-async function fazerCheck(g, id, server) {
-  const keys = Array.isArray(g.fazercardFields) && g.fazercardFields.length ? g.fazercardFields : ["player_id"];
-  if (keys.some((k) => /server|zone/i.test(k)) && !server) return { outcome: "unknown", why: "server ID လို" };
-  const fields = {};
-  keys.forEach((k) => { fields[k] = /server|zone/i.test(k) ? server : id; });
-  try {
-    const res = await fetch(FAZER_URL, {
-      signal: AbortSignal.timeout(9000),
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ categoryId: g.fazercardCategoryId, fields }),
-    });
-    const data = await res.json();
-    if (!res.ok || !data.ok) return { outcome: "unknown", why: `HTTP ${res.status}` };
-    if (data.valid === true) return data.playerName ? { outcome: "valid", name: data.playerName, geo: geoOf(data) } : { outcome: "skip", why: "no name" };
-    return { outcome: "invalid", reason: "id" };
-  } catch {
-    return { outcome: "unknown", why: "network" };
-  }
-}
-
 /* ---------- Result cache (memory + KV) ---------- */
 // Same provider + ID + server reuses the earlier answer (also shares in-flight calls).
 // Found players are remembered for 1 hour (memory + KV), so searching again after the card was deleted is instant.
@@ -753,19 +731,12 @@ const cachedG2 = (game, id, server) =>
     await trackProvider(r).catch(() => {});
     return r;
   });
-const cachedFazer = (g, id, server) =>
-  cached(`f:${g.fazercardCategoryId}|${id}|${server}`, async () => {
-    const r = { ...(await fazerCheck(g, id, server)), provider: "FazerCards" };
-    await trackProvider(r).catch(() => {});
-    return r;
-  });
 const callProvider = async (g, id, server) => {
-  const provider = g.g2bulkCode ? "G2Bulk" : "FazerCards";
-  if (await isDown(provider)) return { outcome: "unknown", why: "maintenance", provider };
-  return g.g2bulkCode ? cachedG2(g.g2bulkCode, id, server) : cachedFazer(g, id, server);
+  if (await isDown("G2Bulk")) return { outcome: "unknown", why: "maintenance", provider: "G2Bulk" };
+  return cachedG2(g.g2bulkCode, id, server);
 };
 
-// Which provider(s) failed, e.g. "G2Bulk (HTTP 502) / FazerCards (network)".
+// Which provider(s) failed, e.g. "G2Bulk (HTTP 502)".
 function busyProviders(results) {
   const seen = new Map();
   for (const r of results) if (r && r.outcome === "unknown" && r.provider) seen.set(r.provider, r.why || "");
@@ -823,7 +794,6 @@ async function probeProviders() {
   };
   const rs = await Promise.all([
     probe("G2Bulk", `${G2}/games/checkPlayerId`, { game: "mlbb", user_id: "1", server_id: "1" }),
-    probe("FazerCards", FAZER_URL, {}),
   ]);
   for (const r of rs) await trackProvider(r).catch(() => {});
 }
@@ -1057,7 +1027,11 @@ const isCardText = (t) => {
 /* CARD-END */
 async function logOrder(env, q, chat, who, rid, asker) {
   if (!env.STATE) return;
-  const info = cardInfo(q.message.text);
+  let info = cardInfo(q.message.text);
+  if (!info.id && env.STATE) {   // rich (table) card: details were saved when it was sent
+    const ci = await env.STATE.get(`ci:${chat}:${q.message.message_id}`, "json").catch(() => null);
+    if (ci) info = { game: ci.g || "", id: ci.i || "", server: ci.s || "" };
+  }
   const now = Date.now();
   const mid = q.message.message_id;
   const meta = {
@@ -1846,7 +1820,7 @@ async function adminCommand(env, m, text, isGroup, owners) {
       await say("✅ Maintenance ပိတ်လိုက်ပါပြီ၊ Bot ပုံမှန်ပြန်အလုပ်လုပ်ပါပြီ", 2 * 60 * 1000);
     } else {
       const downs = [];
-      for (const p of ["G2Bulk", "FazerCards"]) if (await isDown(p)) downs.push(p);
+      for (const p of ["G2Bulk"]) if (await isDown(p)) downs.push(p);
       await usage(
         `🛠 Maintenance: <b>${S.maint === "on" ? "ဖွင့်ထား" : "ပိတ်ထား"}</b>\n` +
           (downs.length ? `🚨 Provider ကျနေတာ: ${downs.join(", ")} (အလိုလို maintenance စာ ပြနေပါတယ်)\n` : "✅ Provider နှစ်ခုလုံး ကောင်းပါတယ်\n") +
@@ -2933,23 +2907,10 @@ const rrows = (rows) => rows.map((r) => `<tg-button-row align="center">${r.map(r
 // Telegram-HTML text (b / i / code, \n) -> rich paragraphs
 const htmlToRich = (h) => String(h).split(/\n+/).map((l) => l.trim()).filter(Boolean).map((l) => `<p>${l}</p>`).join("");
 async function sendUi(env, chat, html, rows, ms, n = 14) {
-  let rs = evenRows(rows, n);
-  if (env.bc) {   // Chat automation: only link buttons are used (no callback buttons, no rich message)
-    rs = rs.map((r) => r.filter((b) => b.url)).filter((r) => r.length);
-    return sendCard(env, chat, html, rs.length ? { reply_markup: { inline_keyboard: toInline(rs) } } : {}, ms);
-  }
-  if (S.rich !== "off" && !/<blockquote/.test(html)) {
-    const r = await tg(env, "sendRichMessage", {
-      chat_id: chat,
-      rich_message: { html: htmlToRich(html) + rrows(rs) },
-      ...(env.replyTo ? { reply_parameters: { message_id: env.replyTo, allow_sending_without_reply: true } } : {}),
-    }).catch(() => null);
-    if (r?.ok) {
-      if (Number(chat) < 0) await scheduleDelete(env, chat, r.result?.message_id, ms);
-      return r;
-    }
-  }
-  return sendCard(env, chat, html, { reply_markup: { inline_keyboard: toInline(rs) } }, ms);
+  // Normal inline keyboard on purpose: every button in a row gets the same width (the rich button grid sized buttons by their text).
+  let rs = rows.filter((r) => r.length);
+  if (env.bc) rs = rs.map((r) => r.filter((b) => b.url)).filter((r) => r.length);   // Chat automation: only link buttons
+  return sendCard(env, chat, html, rs.length ? { reply_markup: { inline_keyboard: toInline(rs) } } : {}, ms);
 }
 
 /* ---------- Package price quote ("ml 86 x3" -> total), order preview, change, USD <-> Ks ---------- */
@@ -3043,7 +3004,7 @@ async function orderPreview(env, m, chat, plan, isGroup) {
       }
     }
     const html = `📦 ${quoteLines(qt)}\n💰 <b>Total: ${fmtKs(qt.total)} Ks</b>` + (warn ? `\n\n${warn}` : "");
-    await runCheck({ ...env, orderExtra: { html, price: qt.total, cost: qt.cost, n: qt.items.length } }, chat, group, o.id, o.server);
+    await runCheck({ ...env, orderExtra: { html, price: qt.total, cost: qt.cost, n: qt.items.length, items: qt.items.map((x) => [String(x.p.amount), x.qty, x.sub]) } }, chat, group, o.id, o.server);
   }
   return true;
 }
@@ -3766,7 +3727,7 @@ async function freshPackages(env, group) {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ structuredQuery: {
-          from: [{ collectionId: GCOLL || "games" }],
+          from: [{ collectionId: GCOLL || "gamesPublic" }],
           where: { fieldFilter: { field: { fieldPath: "name" }, op: "EQUAL", value: { stringValue: name } } },
           select: { fields: ["name", "serverName", "packages", "g2bulkCode", "packageTabLabels", "packageTabs"].map((fieldPath) => ({ fieldPath })) },
         } }),
@@ -3794,6 +3755,16 @@ async function sendPricePicker(env, chat, lang, list) {
 const closeBtn = (env) => ({ text: "Close", data: `px:c:${env.requester || env.uid || 0}`, style: "danger" });
 // Bot API 10.3 rich message (sendRichMessage + HTML): heading, compact table and a button row inside the message.
 // Returns true when Telegram accepted it. Any error -> false, and the caller sends the plain text version instead.
+async function sendRichCard(env, chat, html, extra, ms) {
+  const r = await tg(env, "sendRichMessage", {
+    chat_id: chat,
+    rich_message: { html },
+    ...(env.replyTo ? { reply_parameters: { message_id: env.replyTo, allow_sending_without_reply: true } } : {}),
+    ...(extra || {}),
+  }).catch(() => null);
+  if (r?.ok && Number(chat) < 0) await scheduleDelete(env, chat, r.result?.message_id, ms);
+  return r?.ok ? r : null;
+}
 async function sendRichHtml(env, chat, html, ms) {
   const r = await tg(env, "sendRichMessage", {
     chat_id: chat,
@@ -3865,35 +3836,36 @@ async function sendPrice(env, chat, group, lang, tabIdx, mode) {
   if (!es.length) return send(env, chat, L(lang, "noPrice"));
   const title = esc(group.name) + (tab !== undefined ? " · " + esc(tabLabel(entries, tab)) : "");
   const money = (p) => Number(p.price).toLocaleString("en-US");
-  // Owner in private chat only (never in a group, customers must not see cost): Cost USD (= Cost Ks / admin panel rate) and Cost Ks.
-  const staff = Number(chat) > 0 && idList(env.OWNER_IDS).includes(String(chat));
-  const srate = staff ? await storeRate(env) : 0;
-  const costKs = (p) => (Number(p.cost) > 0 ? Number(p.cost).toLocaleString("en-US") : "-");
-  const costUsd = (p) => (Number(p.cost) > 0 && srate ? (Number(p.cost) / srate).toFixed(2) : "-");
-  if (mode === "copy") {   // Copy button: the list as one code block (tap the block = copy), with its own Close
-    const txt = es.map((e) => (e.server && es.length > 1 ? e.server + "\n" : "") + e.packages.map((p) => `${pkgShort(group.key, p)}  ${p.amount}  ${money(p)} Ks`).join("\n")).join("\n\n");
-    return sendCard(env, chat, `<b>${title}</b>\n<pre>${esc(txt.slice(0, 3500))}</pre>\nအပေါ်က block ကို နှိပ်ရင် Copy ရပါမယ်`, { reply_markup: { inline_keyboard: [[{ text: "Close", callback_data: `px:c:${env.uid || 0}`, style: "danger" }]] } }, MS);
+  // One label per package: the short code, plus the rest of the amount text only when it adds something (never "86 86").
+  const parts = (p) => {
+    const code = String(pkgShort(group.key, p)), amt = String(p.amount).trim();
+    return { code, rest: amt.toLowerCase().startsWith(code.toLowerCase()) ? amt.slice(code.length).trim() : amt };
+  };
+  const cellText = (p) => { const { code, rest } = parts(p); return code + (rest ? " " + rest : ""); };
+  const cell = (p) => { const { code, rest } = parts(p); return `<code>${esc(code)}</code>${rest ? " " + esc(rest) : ""}`; };
+  if (mode === "copy") {   // Copy button: the list as one code block (tap the block = copy); replaces the table, "Table" brings it back
+    const txt = es.map((e) => (e.server && es.length > 1 ? e.server + "\n" : "") + e.packages.map((p) => `${cellText(p)} - ${money(p)} Ks`).join("\n")).join("\n\n");
+    const here = `pr:${group.id}${tabIdx === undefined ? "" : ":" + tabIdx}`;
+    return sendUi(env, chat, `<b>${title}</b>\n<pre>${esc(txt.slice(0, 3500))}</pre>\n<i>Block ကို နှိပ်ရင် Copy ရပါမယ်</i>`, [[{ text: "⬅️ Table", data: here, style: "primary" }, closeBtn(env)]], MS);
   }
   const store = await getStore(env);
   const storeBtn = store && /^https:\/\//.test(store) ? [{ text: L(lang, "btnStore"), url: store, style: "primary" }] : [];
-  // 1) rich message: table with tap-to-copy short code / price
+  const back = Number(chat) > 0
+    ? [tabs.length > 1 ? { text: "⬅️ " + group.name.slice(0, 20), data: `pr:${group.id}`, style: "link" } : { text: "⬅️ " + L(lang, "btnPrice"), data: "pr:l", style: "link" }]
+    : [];
+  const btns = [[{ text: "Copy", data: `px:y:${group.id}:${tabIdx === undefined ? "" : tabIdx}`, style: "primary" }, closeBtn(env)]];
+  const nav = [...storeBtn, ...back];
+  if (nav.length) btns.push(nav);
+  // 1) rich message: simple bordered table (tap a code / price to copy it)
   if (S.rich !== "off" && !env.bc) {
-    let h = `<p>💰 <b>${title}</b></p>`;
-    // Package cell: <code>short code</code> + the rest of the amount text (the code alone when the amount is just that number).
-    const cell = (p) => {
-      const code = String(pkgShort(group.key, p)), amt = String(p.amount).trim();
-      const rest = amt.toLowerCase().startsWith(code.toLowerCase()) ? amt.slice(code.length).trim() : amt;
-      return `<code>${esc(code)}</code>${rest ? " " + esc(rest) : ""}`;
-    };
+    const th = (cols) => `<tr>${cols.map((c) => `<td align="center"><b>${c}</b></td>`).join("")}</tr>`;
+    let h = `<h3>${title}</h3>`;
     for (const e of es) {
-      if (e.server && es.length > 1) h += `<p><b>${esc(e.server)}</b></p>`;
-      h += `<table compact>${e.packages.map((p) => `<tr><td>${cell(p)}</td><td align="right"><code>${money(p)}</code> Ks</td>${srate ? `<td align="right">${costKs(p)} · ${costUsd(p)}$</td>` : ""}</tr>`).join("")}</table>`;
+      if (e.server && es.length > 1) h += `<h4>${esc(e.server)}</h4>`;
+      h += `<table bordered striped>${th(["Package", "Price (Ks)"])}` +
+        e.packages.map((p) => `<tr><td align="center">${cell(p)}</td><td align="center"><code>${money(p)}</code></td></tr>`).join("") + `</table>`;
     }
-    if (srate) h += `<p><i>Cost = Ks · USD (rate ${srate})</i></p>`;
     h += `<p><i>${esc(L(lang, "priceNote"))}</i></p>`;
-    const btns = [[{ text: "Copy", data: `px:y:${group.id}:${tabIdx === undefined ? "" : tabIdx}`, style: "primary" }, closeBtn(env)]];
-    if (storeBtn.length) btns.push(storeBtn);
-    if (Number(chat) > 0 && tabs.length > 1) btns.push([{ text: "⬅️ " + group.name.slice(0, 20), data: `pr:${group.id}`, style: "link" }]);
     if (await sendRichHtml(env, chat, h + rrows(evenRows(btns, 14)), MS).catch(() => false)) return;
   }
   // 2) plain fallback: tap a code to copy, plus a native Copy button with the whole list
@@ -3901,16 +3873,16 @@ async function sendPrice(env, chat, group, lang, tabIdx, mode) {
   const plainLines = [];
   for (const e of es) {
     out += e.server && es.length > 1 ? `\n<b>${esc(e.server)}</b>\n` : "\n";
-    out += e.packages.map((p) => `<code>${esc(pkgShort(group.key, p))}</code> · ${esc(String(p.amount))} — <code>${money(p)}</code> Ks${srate ? ` · cost ${costKs(p)} (${costUsd(p)}$)` : ""}`).join("\n") + "\n";
-    e.packages.forEach((p) => plainLines.push(`${p.amount} - ${money(p)} Ks`));
+    out += e.packages.map((p) => `${cell(p)} — <code>${money(p)}</code> Ks`).join("\n") + "\n";
+    e.packages.forEach((p) => plainLines.push(`${cellText(p)} - ${money(p)} Ks`));
   }
   out += `\n<i>${L(lang, "priceNote")}</i>`;
   let copy = "";
   for (const l of plainLines) { if ((copy ? copy.length + 1 : 0) + l.length > 256) break; copy += (copy ? "\n" : "") + l; }
   const rows = [];
-  if (copy) rows.push([{ text: "Copy", copy_text: { text: copy }, style: "primary", ...ic(env, "ICON_COPY") }]);
-  if (storeBtn.length) rows.push([{ ...storeBtn[0], ...ic(env, "ICON_STORE") }]);
-  rows.push([{ text: "Close", callback_data: `px:c:${env.requester || env.uid || 0}`, style: "danger" }]);
+  if (copy) rows.push([{ text: "Copy", copy_text: { text: copy }, style: "primary", ...ic(env, "ICON_COPY") }, { text: "Close", callback_data: `px:c:${env.requester || env.uid || 0}`, style: "danger" }]);
+  else rows.push([{ text: "Close", callback_data: `px:c:${env.requester || env.uid || 0}`, style: "danger" }]);
+  if (nav.length) rows.push(toInline([nav])[0]);
   return sendCard(env, chat, out.slice(0, 3900), rows.length ? { reply_markup: { inline_keyboard: rows } } : {}, MS);
 }
 
@@ -3961,6 +3933,7 @@ async function customerCallback(env, q, chat, tag, arg, extra) {
       await tg(env, "answerCallbackQuery", { callback_query_id: q.id });
       const group = (await loadGroups(env)).find((g) => g.id === parts[2]);
       if (!group) return;
+      await tg(env, "deleteMessage", { chat_id: chat, message_id: q.message.message_id }).catch(() => {});   // the Copy view takes the table's place
       return sendPrice({ ...env, replyTo: 0 }, chat, group, await getLang(env, uid), parts[3] === undefined || parts[3] === "" ? undefined : Number(parts[3]), "copy");
     }
     return tg(env, "answerCallbackQuery", { callback_query_id: q.id });
@@ -3981,10 +3954,13 @@ async function customerCallback(env, q, chat, tag, arg, extra) {
     if (!group) return send(env, chat, L(lang, "gameNotFound", esc(item.n)));
     return runCheck({ ...env, requester: uid, ownerKb: idList(env.OWNER_IDS).includes(String(uid)) }, chat, group, item.i, item.s);
   }
-  if (tag === "pr") {
-    if (arg === "l") return sendPricePicker(env, chat, lang);
+  if (tag === "pr") {   // game list -> catalog -> price table: each tap replaces the screen (the old message is removed), so only one message is ever left
+    const swap = () => tg(env, "deleteMessage", { chat_id: chat, message_id: q.message.message_id }).catch(() => {});
+    if (arg === "l") { await swap(); return sendPricePicker({ ...env, replyTo: 0 }, chat, lang); }
     const group = (await loadGroups(env)).find((g) => g.id === arg);
-    return group ? sendPrice(env, chat, group, lang, extra === undefined || extra === "" ? undefined : Number(extra)) : send(env, chat, L(lang, "noPrice"));
+    if (!group) return send(env, chat, L(lang, "noPrice"));
+    await swap();
+    return sendPrice({ ...env, replyTo: 0 }, chat, group, lang, extra === undefined || extra === "" ? undefined : Number(extra));
   }
   if (tag === "mo") return showMyOrders(env, chat, uid, lang);
   if (tag === "pm") {
@@ -4232,24 +4208,38 @@ async function priceWatch(env) {
   const prev = await env.STATE.get("pw:snap", "json").catch(() => null);
   await env.STATE.put("pw:snap", JSON.stringify({ rate, snap }));
   if (!prev || !prev.snap) return;
-  const rows = [];
+  const prRows = [];   // [game, package, old, now]  (old 0 = new package)
   for (const [k, [pr, co]] of Object.entries(snap)) {
     const old = prev.snap[k];
     const [g, a] = k.split("|");
-    if (!old) rows.push([g, a, "New", `${pr.toLocaleString("en-US")}`, `${co.toLocaleString("en-US")}`]);
-    else if (old[0] !== pr || old[1] !== co) rows.push([g, a, old[0] !== pr ? `${old[0].toLocaleString("en-US")} > ${pr.toLocaleString("en-US")}` : String(pr), old[1] !== co ? `${old[1].toLocaleString("en-US")} > ${co.toLocaleString("en-US")}` : String(co), ""]);
+    if (!old) prRows.push([g, a, 0, pr]);
+    else if (old[0] !== pr) prRows.push([g, a, old[0], pr]);   // Store prices only (no cost)
   }
   const lines = [];
-  if (prev.rate && rate && Number(prev.rate) !== Number(rate)) lines.push(`<b>USD rate:</b> ${prev.rate} > ${rate}`);
-  if (!rows.length && !lines.length) return;
-  if (rows.length > 60) {   // a rate change rescales every cost: one summary line instead of hundreds of rows
-    lines.push(`<b>${rows.length}</b> package ရဲ့ Price / Cost ပြောင်းသွားပါတယ်`);
-  } else if (rows.length) {
-    const ln = rows.slice(0, 30).map((r) => `• <b>${esc(r[0])}</b> <code>${esc(r[1])}</code> — ${r[4] ? `New ${esc(r[3])}` : esc(r[2])} · cost ${esc(r[4] ? r[4] : r[3])}`);
-    lines.push(ln.join("\n"));
-    if (rows.length > 30) lines.push(`နောက်ထပ် ${rows.length - 30} ခု`);
+  // USD rate changes are not reported (only Store package prices are)
+  const total = prRows.length;
+  if (!total && !lines.length) return;
+  const fmtN = (n) => (n > 0 ? Number(n).toLocaleString("en-US") : "-");
+  const pct = (a, b) => (a > 0 ? `${b >= a ? "+" : "-"}${Math.abs(((b - a) / a) * 100).toFixed(1)}%` : "New");
+  if (total > 60) {   // a rate change rescales every cost: one summary line instead of hundreds of rows
+    lines.push(`<b>${total}</b> package ရဲ့ ဈေးပြောင်းသွားပါတယ်`);
+    return notifyOwners(env, `<b>Price update</b>\n` + lines.join("\n"));
   }
-  await notifyOwners(env, `<b>Price update</b>\n` + lines.join("\n"));
+  const tbl = (cap, rs) => (rs.length
+    ? `<p>${cap}</p><table bordered striped><tr>${["Package", "Old", "Now", "Change"].map((c) => `<td align="center"><b>${c}</b></td>`).join("")}</tr>` +
+      rs.map((r) => `<tr><td align="center">${esc(r[1])}</td><td align="center">${fmtN(r[2])}</td><td align="center">${fmtN(r[3])}</td><td align="center">${pct(r[2], r[3])}</td></tr>`).join("") + `</table>`
+    : "");
+  const games = [...new Set(prRows.map((r) => r[0]))];
+  const rich = lines.map((l) => `<p>${l}</p>`).join("") + games.map((g) => `<h3>${esc(g)}</h3>` + tbl("Price updated (MMK)", prRows.filter((r) => r[0] === g))).join("");
+  const bullets = prRows.map((r) => `• <b>${esc(r[0])}</b> <code>${esc(r[1])}</code> — ${fmtN(r[2])} > ${fmtN(r[3])}`).slice(0, 30);
+  const plain = `<b>Price update</b>\n` + [...lines, ...bullets].join("\n");
+  await Promise.all(idList(env.OWNER_IDS).map(async (o) => {
+    if (S.rich !== "off") {
+      const r = await tg(env, "sendRichMessage", { chat_id: o, rich_message: { html: rich } }).catch(() => null);
+      if (r?.ok) return;
+    }
+    await tg(env, "sendMessage", { chat_id: o, text: plain, parse_mode: "HTML" }).catch(() => {});
+  }));
 }
 
 // Live G2Bulk wallet in USD (null = could not read it; the order call itself is then the check).
@@ -4315,14 +4305,14 @@ async function showHealth(env, chat) {
   const ok = (b) => (b ? "✅" : "❌");
   const age = GDOCS.t ? Math.round((Date.now() - GDOCS.t) / 1000) + " စက္ကန့်အရင်" : "—";
   const w = wh?.result || {};
-  const down = ["G2Bulk", "FazerCards"].filter((p) => PH.get(p)?.down);
+  const down = ["G2Bulk"].filter((p) => PH.get(p)?.down);
   const lines = [
     "🩺 <b>System အခြေအနေ</b>",
     "",
     `${ok(groups.length)} Game list: ${groups.length} (Firestore ဖတ်ထားတာ ${age})`,
     `${ok(pay.length)} Payment method: ${pay.length}`,
     `${ok(rate)} USD rate: ${rate ? rate + " (Admin panel)" : "မဖတ်နိုင် — settings/publicRates စစ်ပါ"}`,
-    `${ok(!down.length)} Provider: ${down.length ? "🚨 ကျနေ — " + down.join(", ") : "G2Bulk · FazerCards ကောင်း"}`,
+    `${ok(!down.length)} Provider: ${down.length ? "🚨 ကျနေ — " + down.join(", ") : "G2Bulk ကောင်း"}`,
     bal === undefined ? "➖ Wallet: G2BULK_API_KEY မထည့်ရသေး" : `${ok(bal !== null)} Wallet: ${bal === null ? "မဖတ်နိုင်" : bal.toFixed(2) + " USD (" + (rate ? "~" + Math.round(bal * rate).toLocaleString("en-US") + " Ks" : "rate မရ") + ")"}`,
     `${ok(env.STATE)} Storage: ${env.DB ? "D1" : env.STATE ? "KV" : "မရှိ (auto-delete / မှတ်တမ်း မရ)"}`,
     `${ok(!w.last_error_message)} Webhook: pending ${w.pending_update_count ?? "?"}${w.last_error_message ? " · " + esc(String(w.last_error_message).slice(0, 80)) : ""}`,
@@ -4875,13 +4865,13 @@ async function autoScan(env, chat, groups, id, server) {
   const noteId = note?.result?.message_id;
   const started = Date.now();
 
-  // Unique provider calls (identical G2Bulk code / Fazer category are shared across regions & groups).
+  // Unique provider calls (identical G2Bulk codes are shared across regions & groups).
   const calls = new Map(); // key -> { run, result }
   const plan = groups.map((group) => ({
     group,
     items: group.entries.map((g) => {
-      const g2 = !!g.g2bulkCode;
-      const key = (g2 ? "g:" + g.g2bulkCode : "f:" + g.fazercardCategoryId) + "|" + id + "|" + server;
+      const g2 = true;
+      const key = "g:" + g.g2bulkCode + "|" + id + "|" + server;
       if (!calls.has(key)) calls.set(key, { run: () => callProvider(g, id, server), result: null });
       return { g, g2, key };
     }),
@@ -5038,7 +5028,11 @@ async function onCallback(q, env) {
       });
     await tg(env, "answerCallbackQuery", { callback_query_id: q.id });
     const text = q.message.text || "";
-    const ci = cardInfo(text);
+    let ci = cardInfo(text);
+    if (!ci.id && env.STATE) {
+      const sv = await env.STATE.get(`ci:${chat}:${q.message.message_id}`, "json").catch(() => null);
+      if (sv) ci = { game: sv.g || "", id: sv.i || "", server: sv.s || "" };
+    }
     const value = (tag === "c" ? text.match(/^✅\s*(.+)/m)?.[1] : ci.server ? `${ci.id}(${ci.server})` : ci.id)?.trim();
     if (!value) return;
     return sendCard({ ...env, replyTo: q.message.message_id }, chat, `📋 နှိပ်ပြီး copy ယူပါ\n<code>${esc(value)}</code>`, {}, 5 * 60 * 1000);
@@ -5071,8 +5065,7 @@ function dropOptions(group) {
   const out = [];
   for (const e of group.entries) {
     const g2 = sel(e.g2bulkServerMode, e.g2bulkServerOptions);
-    const fz = sel(e.fazercardServerMode, e.fazercardServerOptions);
-    const list = (e.g2bulkCode ? g2 || fz : fz || g2) || [];
+    const list = g2 || [];
     for (const o of list) {
       const n = norm(o);
       if (n.label && n.value && !out.some((x) => x.entry === e && x.value === n.value)) out.push({ ...n, entry: e });
@@ -5193,8 +5186,25 @@ async function sendValid(env, chat, group, results, id, server, maxCards = Infin
     if (store) rows.push([{ text: "Store ဝင်ရန်", url: store, style: "primary", ...ic(env, "ICON_STORE") }]);
     const wantsDone = env.requester && (Number(chat) > 0 ? env.ownerKb : env.hasReceipt);   // group: only image + ID gets Done / Reject
     if (wantsDone) rows.push(doneRejectRow(env.requester, env));   // group: admins mark the order done or rejected (side by side, one row)
-    const sent = await sendCard(env, chat, bq(card), { reply_markup: { inline_keyboard: rows } });
+    // Details as a bordered table (rich message). Same buttons as before ride along as the normal reply_markup, so Copy / Store / Done / Reject behave exactly the same.
+    // Falls back to the plain card when rich messages are off, Telegram refuses it, or Copy ID is "restricted" (a tappable <code> cannot be restricted).
+    let sent = null, rich = false;
+    if (S.rich !== "off" && S.richcard !== "off" && !env.bc && !(S.copyid === "restricted" && env.requester)) {
+      const row = (k, v) => `<tr><td><b>${k}</b></td><td>${v}</td></tr>`;
+      let h = `<table bordered>${row("Game", esc(group.name))}${row("Name", `<b>${esc(r.name)}</b>`)}${row("ID", `<code>${esc(id)}</code>`)}` +
+        (showServer ? row("Server", `<code>${esc(server)}</code>`) : "") + (region ? row("Region", esc(region)) : "") + `</table>`;
+      if (ox && ox.items && ox.items.length) {
+        h += `<table bordered><tr>${["Package", "Qty", "Price (Ks)"].map((c) => `<td align="center"><b>${c}</b></td>`).join("")}</tr>` +
+          ox.items.map((it) => `<tr><td>${esc(it[0])}</td><td align="center">${it[1]}</td><td align="right">${fmtKs(it[2])}</td></tr>`).join("") +
+          `<tr><td><b>Total</b></td><td></td><td align="right"><b>${fmtKs(ox.price)}</b></td></tr></table>`;
+      }
+      sent = await sendRichCard(env, chat, h, { reply_markup: { inline_keyboard: rows } }, autodelMs());
+      rich = !!sent;
+    }
+    if (!sent) sent = await sendCard(env, chat, bq(card), { reply_markup: { inline_keyboard: rows } });
     const info = { g: group.name, i: id, s: group.idOnly ? "" : server };
+    // A rich card has no text to parse back: keep game / ID / server in storage for Done, Reject and Copy ID.
+    if (rich && env.STATE && sent?.result?.message_id) await env.STATE.put(`ci:${chat}:${sent.result.message_id}`, JSON.stringify(info), { expirationTtl: ORDER_TTL_S }).catch(() => {});
     if (ox && env.STATE && sent?.result?.message_id) await env.STATE.put(`pv:${chat}:${sent.result.message_id}`, JSON.stringify({ p: Math.round(ox.price), c: Math.round(ox.cost || 0), n: ox.n }), { expirationTtl: ORDER_TTL_S }).catch(() => {});
     if (wantsDone && Number(chat) < 0) {
       await trackPending(env, chat, sent?.result?.message_id, info, env.requester);
