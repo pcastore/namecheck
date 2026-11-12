@@ -45,6 +45,17 @@ const WELCOME_TTL_MS = 10 * 60 * 1000;
 let KV = null;                        // set per request from env.STATE
 let ENV_G = null;                     // last env (used by the provider health tracker)
 let LAST_SWEEP = 0;
+const SEEN_UPD = new Set();           // Telegram re-sends an update when the answer is slow: handle each update_id once
+const ERR_AT = new Map();
+async function reportError(env, e) {
+  console.error(e);
+  const msg = String((e && (e.stack || e.message)) || e).split("\n").slice(0, 3).join(" | ").slice(0, 300);
+  const key = msg.slice(0, 80);
+  if (Date.now() - (ERR_AT.get(key) || 0) < 10 * 60 * 1000) return;   // the same error at most once per 10 minutes
+  if (ERR_AT.size > 200) ERR_AT.clear();
+  ERR_AT.set(key, Date.now());
+  await notifyOwners(env, `🐞 <b>Bot error</b>\n<code>${esc(msg)}</code>`).catch(() => {});
+}
 const RATE_MAX = 3;                   // checks per user per window
 const RATE_WINDOW_MS = 60 * 1000;
 
@@ -81,13 +92,19 @@ const SETTINGS = {
   links: ["ခွင့်ပြုတဲ့ link domain (, နဲ့ခြား)", "", "text", "ဥပမာ: /set links youtube.com,facebook.com (ရှင်းရန် /set links reset)"],
   copyid: ["Copy ID ခလုတ် (public = လူတိုင်း၊ restricted = ပို့တဲ့သူ + admin ပဲ)", "public", "enum:public,restricted", "/set copyid public|restricted"],
   summary: ["နေ့စဉ် စာရင်းချုပ် (Owner ဆီ)", "on", "onoff", "/set summary on|off"],
-  idprefix: ["Group မှာ ID(Server) ပုံစံ သို့ 'id' ရှေ့ခံမှ စစ်မလား (on = စစ်၊ off = ဂဏန်းတွေ့သမျှ စစ်)", "on", "onoff", "/set idprefix on|off"],
+  calc: ["Calculator (auto = ဂဏန်းတွက်စာကို auto ဖြေ၊ cmd = /calc ပဲ၊ off = ပိတ်)", "auto", "enum:auto,cmd,off", "/set calc auto|cmd|off"],
+  quote: ["Game + package ဈေးတွက် (ml 86 x3 → စုစုပေါင်း)", "on", "onoff", "/set quote on|off"],
+  orderpv: ["Customer order (ml ID server 86 x3) ကို ID စစ်ပြီး ဈေးစုစုပေါင်းပါ ပြမလား", "on", "onoff", "/set orderpv on|off"],
+  idprefix: ["Group မှာ ID(Server) ပုံစံ သို့ 'id' ရှေ့ခံမှ စစ်မလား (on = ရှေ့ခံလို၊ off = ID ပို့တာနဲ့ auto စစ်)", "off", "onoff", "/set idprefix on|off"],
+  pricewatch: ["Price / Cost / USD rate ပြောင်းရင် Owner ကို table နဲ့ သတိပေး (cron ၅ မိနစ်)", "on", "onoff", "/set pricewatch on|off"],
   rich: ["Rich message (Bot API 10.3: table + ခလုတ်) သုံးမလား — ဈေးနှုန်းမှာ", "on", "onoff", "/set rich on|off (app ဗားရှင်းဟောင်းမှာ မမြင်ရရင် off)"],
   pay: ["Payment auto-reply (KPay/Wave ... မေးရင် ဖြေမလား)", "on", "onoff", "/set pay on|off"],
   dmopen: ["Customer တွေ DM မှာ Bot သုံးခွင့် (on = ရ၊ off = Owner ပဲ)", "on", "onoff", "/set dmopen on|off"],
   dmhours: ["DM ဖွင့်ချိန် (မြန်မာ နာရီ) ဥပမာ 9-22 — ပြင်ပရင် away စာပို့", "", "text", "ဥပမာ: /set dmhours 9-22 (ရှင်းရန် /set dmhours reset)"],
   offmsg: ["DM ပိတ်ချိန် away စာ (ဗလာ = မူလစာ)", "", "text", "ဥပမာ: /set offmsg ည ၁၀ နာရီကနေ မနက် ၉ နာရီထိ ပိတ်ပါတယ်"],
-  summaryhour: ["စာရင်းချုပ်ပို့မယ့် နာရီ (မြန်မာ 0-23)", "21", "hour", "ဥပမာ: /set summaryhour 22"],
+  summaryhour: ["စာရင်းချုပ်ပို့မယ့် နာရီ (မြန်မာ 0-23)", "23", "hour", "ဥပမာ: /set summaryhour 22"],
+  buy: ["Admin ဝယ်ခြင်း (game + ID + package ပို့ရင် Wallet လောက်ရင် တန်းဝယ်)", "on", "onoff", "/set buy on|off (G2BULK_API_KEY လိုတယ်)"],
+  lowbal: ["Wallet ကျန်ငွေ ဒီ USD အောက်ရောက်ရင် Owner ကို သတိပေး", "off", "numoff", "ဥပမာ: /set lowbal 20 (ပိတ်ရန် /set lowbal off)"],
 };
 function parseSetting(k, v) {
   const t = SETTINGS[k][2];
@@ -97,6 +114,7 @@ function parseSetting(k, v) {
   if (t === "onoff") return low === "on" || low === "off" ? low : null;
   if (t === "numoff" && low === "off") return "off";
   if (t.startsWith("enum:")) return t.slice(5).split(",").includes(low) ? low : null;
+  if (t === "usd") return /^\d{3,6}(\.\d{1,2})?$/.test(x) && Number(x) >= 100 ? x : null;
   if (!/^\d+$/.test(x)) return null;
   const n = Number(x);
   if (t === "hour") return n <= 23 ? String(n) : null;
@@ -106,7 +124,7 @@ const RESERVED_CMDS = [
   "start", "help", "id", "reload", "setwelcome", "welcome", "captcha", "addword", "delword", "words", "stats", "addfaq", "delfaq",
   "faqs", "setstore", "setdone", "adminhelp", "orders", "warns", "unwarn", "unban", "addalias", "delalias", "aliases", "settings",
   "set", "maint", "seticon", "emojiid", "summary", "addcmd", "delcmd", "cmds", "hidegame", "showgame", "announce", "groups", "lock", "unlock",
-  "post", "posts", "delpost", "addchannel", "delchannel", "channels", "pay",
+  "calc", "change", "list", "post", "posts", "delpost", "addchannel", "delchannel", "channels", "pay", "pkgs", "setpkg", "delpkg", "balance", "health",
 ];
 const FULL_PERMS = {
   can_send_messages: true, can_send_audios: true, can_send_documents: true, can_send_photos: true, can_send_videos: true,
@@ -138,13 +156,39 @@ let MENU_SET = false;
 async function ensureMenu(env, force = false) {
   if (!force && (MENU_SET || !env.STATE)) return;
   MENU_SET = true;
-  if (!force && (await env.STATE.get("cfg:menu:v1").catch(() => null))) return;
-  const a = await tg(env, "setMyCommands", { commands: [
+  if (!force && (await env.STATE.get("cfg:menu:v4").catch(() => null))) return;
+  const base = [
     { command: "start", description: "📋 Menu ဖွင့်ရန်" },
+    { command: "price", description: "💰 ဈေးနှုန်း" },
+    { command: "calc", description: "🧮 Calculator" },
     { command: "help", description: "ℹ️ အကူအညီ" },
-  ] }).catch(() => null);
+  ];
+  const adminCmds = [
+    { command: "start", description: "📋 Menu ဖွင့်ရန်" },
+    { command: "balance", description: "💰 Wallet Balance" },
+    { command: "orders", description: "📋 Done order စာရင်း" },
+    { command: "warns", description: "⚠️ Strike ရှိသူများ" },
+    { command: "adminhelp", description: "🛠 Admin commands" },
+    { command: "calc", description: "🧮 Calculator" },
+    { command: "price", description: "💰 ဈေးနှုန်း" },
+  ];
+  const ownerCmds = [
+    { command: "start", description: "📋 Menu ဖွင့်ရန်" },
+    { command: "post", description: "📝 Post တင်ရန်" },
+    { command: "posts", description: "⏰ Schedule စာရင်း" },
+    { command: "channels", description: "📢 Channels" },
+    { command: "balance", description: "💰 Wallet Balance" },
+    { command: "orders", description: "📋 Done order စာရင်း" },
+    { command: "stats", description: "📊 Stats" },
+    { command: "health", description: "🩺 System အခြေအနေ" },
+    { command: "calc", description: "🧮 Calculator" },
+    { command: "adminhelp", description: "🛠 Admin commands" },
+  ];
+  const a = await tg(env, "setMyCommands", { commands: base }).catch(() => null);
+  await tg(env, "setMyCommands", { commands: adminCmds, scope: { type: "all_chat_administrators" } }).catch(() => null);
+  for (const o of idList(env.OWNER_IDS)) await tg(env, "setMyCommands", { commands: ownerCmds, scope: { type: "chat", chat_id: Number(o) } }).catch(() => null);
   const b = await tg(env, "setChatMenuButton", { menu_button: { type: "commands" } }).catch(() => null);
-  if (env.STATE && a?.ok && b?.ok) await env.STATE.put("cfg:menu:v1", "1").catch(() => {});
+  if (env.STATE && a?.ok && b?.ok) await env.STATE.put("cfg:menu:v4", "1").catch(() => {});
   return { commands: a, menu_button: b };
 }
 
@@ -250,18 +294,25 @@ export default {
       const r = await tg(env, "setWebhook", {
         url: `${url.origin}/`,
         secret_token: env.WEBHOOK_SECRET,
-        allowed_updates: ["message", "callback_query", "my_chat_member"],
+        allowed_updates: ["message", "callback_query", "my_chat_member", "business_connection", "business_message"],
       });
       const menu = await ensureMenu(env, true);
       return new Response(JSON.stringify({ webhook: r, menu }), { headers: { "content-type": "application/json" } });
     }
+
+    if (url.pathname.startsWith("/api/")) return apiHandle(req, env, url);
 
     if (req.method !== "POST") return new Response("OK");
     if (req.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.WEBHOOK_SECRET)
       return new Response("Unauthorized", { status: 401 });
 
     const update = await req.json();
-    ctx.waitUntil(handle(update, env).catch((e) => console.error(e)));
+    if (update.update_id) {
+      if (SEEN_UPD.has(update.update_id)) return new Response("OK");
+      if (SEEN_UPD.size > 500) SEEN_UPD.clear();
+      SEEN_UPD.add(update.update_id);
+    }
+    ctx.waitUntil(handle(update, env).catch((e) => reportError(env, e)));
     if (KV && !MENU_SET) ctx.waitUntil(ensureMenu(env).catch((e) => console.error(e)));
     if (KV && Date.now() - LAST_SWEEP > 60 * 1000) {   // backup for the cron: sweep at most once a minute while the bot is busy
       LAST_SWEEP = Date.now();
@@ -280,6 +331,7 @@ export default {
     LAST_SWEEP = Date.now();
     ctx.waitUntil(sweep(env).catch((e) => console.error(e)));
     ctx.waitUntil(probeProviders().catch((e) => console.error(e)));
+    ctx.waitUntil(priceWatch(env).catch((e) => console.error(e)));
   },
 };
 
@@ -298,8 +350,8 @@ const send = async (env, chat_id, text, extra = {}) => {
     chat_id,
     text,
     parse_mode: "HTML",
+    ...(env.bc ? { business_connection_id: env.bc } : {}),   // Chat automation: answer inside the owner's account chat
     ...(env.replyTo ? { reply_parameters: { message_id: env.replyTo, allow_sending_without_reply: true } } : {}),
-    ...(env.ownerKb && !extra.reply_markup ? { reply_markup: mainKb() } : {}),   // owner, private chat: any reply puts the Menu keyboard back (no /start needed)
     ...extra,
   };
   const r = await tg(env, "sendMessage", body);
@@ -456,14 +508,22 @@ function hash(s) {
   return h.toString(36);
 }
 
-let CACHE = { t: 0, groups: null };
-async function loadGroups(env) {
-  if (CACHE.groups && Date.now() - CACHE.t < 5 * 60 * 1000) return CACHE.groups;
+// All games are read from Firestore ONCE and shared: memory (5 min) -> KV/D1 (shared by every Worker instance, 5 min) -> Firestore.
+// Games list, groups, prices and packages all come from this single read. /reload forces a new read.
+const GAME_FIELDS = [...FS_FIELDS, "packages", "packageTabLabels", "packageTabs"];
+const GAMES_TTL_MS = 5 * 60 * 1000;
+let GDOCS = { t: 0, docs: null };
+async function loadGameDocs(env) {
+  if (GDOCS.docs && Date.now() - GDOCS.t < GAMES_TTL_MS) return GDOCS.docs;
+  if (env.STATE) {
+    const s = await env.STATE.get("fs:games", "json").catch(() => null);
+    if (s && Array.isArray(s.docs) && Date.now() - s.t < GAMES_TTL_MS) { GDOCS = s; return s.docs; }
+  }
   const docs = [];
   let token = "";
   for (let i = 0; i < 10; i++) {
     const qs = new URLSearchParams({ pageSize: "300", key: env.FIREBASE_API_KEY || FS_KEY });
-    FS_FIELDS.forEach((f) => qs.append("mask.fieldPaths", f));
+    GAME_FIELDS.forEach((f) => qs.append("mask.fieldPaths", f));
     if (token) qs.set("pageToken", token);
     let j;
     try {
@@ -477,6 +537,15 @@ async function loadGroups(env) {
     token = j.nextPageToken || "";
     if (!token) break;
   }
+  if (!docs.length) return GDOCS.docs || [];   // Firestore failed: keep serving the old copy
+  GDOCS = { t: Date.now(), docs };
+  if (env.STATE) await env.STATE.put("fs:games", JSON.stringify(GDOCS), { expirationTtl: 900 }).catch(() => {});
+  return docs;
+}
+let CACHE = { t: 0, groups: null };
+async function loadGroups(env) {
+  if (CACHE.groups && Date.now() - CACHE.t < 60 * 1000 && CACHE.src === GDOCS.docs) return CACHE.groups;
+  const docs = await loadGameDocs(env);
   if (!docs.length) return CACHE.groups || [];
 
   // Entries that share a name are regions of one game (the store groups them the same way).
@@ -503,7 +572,7 @@ async function loadGroups(env) {
   const groups = [...map.values()].filter((g) => !(S.hidden || []).includes(g.key)).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
   groups.forEach((g) => { g.idOnly = !g.dropdown && g.entries.every(idOnlyEntry); });
   groups.hidden = [];
-  CACHE = { t: Date.now(), groups };
+  CACHE = { t: Date.now(), groups, src: docs };
   return groups;
 }
 
@@ -516,6 +585,7 @@ const ALIASES = {
   mcgg: "magic chess",
   sm: "sausage man",
   ml: "mobile legends",
+  m: "mobile legends",
   ff: "free fire",
   hok: "honor of kings",
   hsr: "star rail",
@@ -554,10 +624,18 @@ function findGroups(groups, query) {
 // "mlbb 123456789(2002)", "mobile legends 123456789 2002", "123456789(2002)", "123456789|2002"
 function parseInput(text) {
   // Any non-letter/digit character (space, - _ . / | , : ; ( ) + * # etc.) works as a separator.
+  // "123456789abc2002" -> ID, letters, server: letters stuck between the two numbers count as a separator too.
+  text = String(text).replace(/(\d{5,20})([A-Za-z]+)(\d{1,6})(?!\d)/g, "$1 $2 $3");
   const tokens = text.split(/[^\p{L}\p{N}\p{M}]+/u).filter(Boolean);
-  const i = tokens.findIndex((t) => /^\d{5,}$/.test(t));
+  const i = tokens.findIndex((t) => /^\d{5,20}$/.test(t));
   if (i === -1) return { tokens, query: tokens.join(" "), id: "", server: "" };
-  return { tokens, query: tokens.slice(0, i).join(" "), id: tokens[i], server: tokens[i + 1] || "" };
+  // Server = the first short number after the ID; letters / symbols in between ("id 123456789 server 2002") are ignored.
+  // "server2002" / "sv2002" / "zone2002" (label glued to the number) -> 2002.
+  const after = tokens.slice(i + 1).map((t) => (t.match(/^(?:server|svr|sv|zone|s|z)(\d{1,6})$/i) || [, t])[1]);
+  // A leading "id" word is not a game name ("id 123456789 2002" in private chat).
+  const query = tokens.slice(0, i).filter((t) => !/^(?:id|အိုင်ဒီ)$/i.test(t)).join(" ");
+  const server = /^\d{1,6}$/.test(after[0] || "") ? after[0] : after.find((t) => /^\d{1,6}$/.test(t)) || after[0] || "";
+  return { tokens, query, id: tokens[i], server };
 }
 
 /* ---------- Providers ---------- */
@@ -587,6 +665,7 @@ async function g2Check(game, id, server) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ game, user_id: id, server_id: server || undefined }),
+      signal: AbortSignal.timeout(9000),
     });
   } catch {
     return { outcome: "unknown", why: "network" };
@@ -618,6 +697,7 @@ async function fazerCheck(g, id, server) {
   keys.forEach((k) => { fields[k] = /server|zone/i.test(k) ? server : id; });
   try {
     const res = await fetch(FAZER_URL, {
+      signal: AbortSignal.timeout(9000),
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ categoryId: g.fazercardCategoryId, fields }),
@@ -980,6 +1060,14 @@ async function logOrder(env, q, chat, who, rid, asker) {
     a: who.slice(0, 30), u: q.from.id, g: info.game.slice(0, 40), i: info.id.slice(0, 40), s: info.server.slice(0, 20),
     t: now, c: String(chat), m: rid || 0, mn: String(asker?.first_name || "").slice(0, 25),
   };
+  const pv = await env.STATE.get(`pv:${chat}:${mid}`, "json").catch(() => null);
+  if (pv && pv.p > 0) { meta.p = Math.round(pv.p); if (pv.c > 0) meta.c = Math.round(pv.c); }
+  if (info.id) {   // the same ID + game finished twice within 30 minutes: tell the owners
+    const dk = `dd:${info.game}:${info.id}:${info.server}`.slice(0, 180);
+    const prevDone = Number(await env.STATE.get(dk).catch(() => 0)) || 0;
+    await env.STATE.put(dk, String(now), { expirationTtl: 1800 }).catch(() => {});
+    if (prevDone) await notifyOwners(env, `⚠️ <b>Done ထပ်နေ</b>\n${esc(info.game)} <code>${esc(info.id)}${info.server ? `(${esc(info.server)})` : ""}</code>\n${Math.max(1, Math.round((now - prevDone) / 60000))} မိနစ်အလိုကလည်း Done လုပ်ထားပြီး — ${esc(who)}`).catch(() => {});
+  }
   await Promise.all([
     env.STATE.put(`ord:${dayStr()}:${String(now).padStart(14, "0")}:${chat}:${mid}`, "1", { expirationTtl: ORDER_TTL_S, metadata: meta }),
     env.STATE.put(`done:${chat}:${mid}`, "1", { expirationTtl: Math.max(3 * 3600, Math.ceil(pendingMs() / 1000) + 3600) }),
@@ -1052,18 +1140,28 @@ async function buildSummary(env, back = 0) {
   const label = back === 0 ? "ဒီနေ့" : back === 1 ? "မနေ့က" : dayStr(back);
   const s = (await env.STATE.get(dayKey(back), "json").catch(() => null)) || { found: 0, notfound: 0, games: {} };
   const rows = await listOrders(env, `ord:${dayStr(back)}:`, () => true);
+  const sales = rows.filter((x) => x.p > 0).concat(await listOrders(env, `sale:${dayStr(back)}:`, () => true));
   const per = {};
   rows.forEach((x) => (per[x.a] = (per[x.a] || 0) + 1));
   const adm = Object.entries(per).sort((a, b) => b[1] - a[1]).map(([a, n]) => `• ${esc(String(a).slice(0, 25))} — ${n}`).join("\n");
   const top = Object.entries(s.games || {}).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([g, n]) => `• ${esc(g)} — ${n}`).join("\n");
   return (
-    `📊 <b>${esc(label)} စာရင်းချုပ်</b>\n\n🔎 စစ်ခဲ့တာ: ${(s.found || 0) + (s.notfound || 0)}\n✅ တွေ့: ${s.found || 0}\n❌ မတွေ့: ${s.notfound || 0}\n📦 Done: ${rows.length}` +
+    `📊 <b>${esc(label)} စာရင်းချုပ်</b>\n\n🔎 စစ်ခဲ့တာ: ${(s.found || 0) + (s.notfound || 0)}\n✅ တွေ့: ${s.found || 0}\n❌ မတွေ့: ${s.notfound || 0}\n📦 Done: ${rows.length}` + salesText(sales) +
     (adm ? `\n\n👤 Admin အလိုက် Done\n${adm}` : "") +
     (top ? `\n\n🎮 အများဆုံး\n${top}` : "")
   );
 }
+// sales = rows with p (selling price) and optionally c (cost): admin-bought orders and customer orders that were marked Done
+function salesText(sales) {
+  if (!sales.length) return "";
+  const rev = sales.reduce((s, x) => s + (x.p || 0), 0);
+  const known = sales.filter((x) => x.c > 0);
+  const profit = known.reduce((s, x) => s + (x.p - x.c), 0);
+  return `\n\n💰 ရောင်းရငွေ: ${fmtKs(rev)} Ks (${sales.length} order)` + (known.length ? `\n📈 အမြတ်: ${fmtKs(profit)} Ks${known.length < sales.length ? ` (cost သိတဲ့ ${known.length}/${sales.length} order ကိုပဲ တွက်)` : ""}` : "");
+}
 async function buildWeek(env) {
   let found = 0, notfound = 0, done = 0;
+  const allSales = [];
   const per = {}, games = {};
   for (let d = 0; d < 7; d++) {
     const s = (await env.STATE.get(dayKey(d), "json").catch(() => null)) || {};
@@ -1071,18 +1169,19 @@ async function buildWeek(env) {
     notfound += s.notfound || 0;
     for (const [g, n] of Object.entries(s.games || {})) games[g] = (games[g] || 0) + n;
     const rows = await listOrders(env, `ord:${dayStr(d)}:`, () => true);
+    allSales.push(...rows.filter((x) => x.p > 0), ...(await listOrders(env, `sale:${dayStr(d)}:`, () => true)));
     done += rows.length;
     rows.forEach((x) => (per[x.a] = (per[x.a] || 0) + 1));
   }
   const fmt = (o) => Object.entries(o).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `• ${esc(String(k).slice(0, 25))} — ${n}`).join("\n");
-  return `📊 <b>ရက် ၇ ရက် စာရင်းချုပ်</b>\n(ကောင်တာက ၃ ရက်ပဲ သိမ်းလို့ စစ်တာအရေအတွက်က နောက်ဆုံး ၃ ရက်စာပါ၊ Done က ၇ ရက်စာ)\n\n🔎 စစ်ခဲ့တာ: ${found + notfound} (✅ ${found} · ❌ ${notfound})\n📦 Done: ${done}` +
+  return `📊 <b>ရက် ၇ ရက် စာရင်းချုပ်</b>\n(ကောင်တာက ၃ ရက်ပဲ သိမ်းလို့ စစ်တာအရေအတွက်က နောက်ဆုံး ၃ ရက်စာပါ၊ Done က ၇ ရက်စာ)\n\n🔎 စစ်ခဲ့တာ: ${found + notfound} (✅ ${found} · ❌ ${notfound})\n📦 Done: ${done}` + salesText(allSales) +
     (done ? `\n\n👤 Admin အလိုက်\n${fmt(per)}` : "") + (Object.keys(games).length ? `\n\n🎮 အများဆုံး\n${fmt(games)}` : "");
 }
 async function dailySummary(env) {
   if (!env.STATE || S.summary === "off") return;
   if (!idList(env.OWNER_IDS).length) return;
   const hour = new Date(Date.now() + 6.5 * 3600e3).getUTCHours();
-  const at = S.summaryhour !== undefined ? Number(S.summaryhour) : 21;
+  const at = S.summaryhour !== undefined ? Number(S.summaryhour) : 23;
   if (hour < at) return;
   const key = "sum:" + dayStr();
   if (await env.STATE.get(key).catch(() => null)) return;
@@ -1474,6 +1573,10 @@ const ADMIN_PAGES = {
       "<code>/delalias sm</code> · <code>/aliases</code> (ထည့်ထားတာ + Bot မှာပါပြီးသား)",
       "Game နာမည်ရဲ့ ရှေ့စာလုံးတွေ (ဥပမာ gi) လည်း အလိုလိုရ",
       "",
+      "<b>Package အတိုကောက်</b> (Owner)",
+      "<code>/pkgs ml</code> — အတိုကောက်စာရင် (86 · wp ...) · <code>/setpkg ml wp = weekly pass</code> ပြင် · <code>/delpkg ml wp</code> ဖျက်",
+      "အရေအတွက်: <code>wp2</code> · <code>86x3</code>",
+      "",
       "<b>Game ပိတ်/ဖွင့်</b> (Owner)",
       "<code>/hidegame mobile legends</code> — name check မှာ ဖျောက် · <code>/showgame mobile legends</code> ပြန်ဖွင့်",
       "<code>/hidegame</code> — ပိတ်ထားတဲ့စာရင်း",
@@ -1492,7 +1595,8 @@ const ADMIN_PAGES = {
       "• antispam / linkfilter — on | off",
       "• links — ခွင့်ပြုတဲ့ domain (, နဲ့ခြား)",
       "• copyid — public (လူတိုင်း) | restricted (ပို့တဲ့သူ + admin ပဲ)",
-      "• summary — on | off · summaryhour — စာရင်းချုပ်ပို့မယ့်နာရီ 0–23 (မူလ ၂၁)",
+      "• lowbal — Wallet ကျန်ငွေ USD ဒီအောက်ရောက်ရင် Owner ကို သတိပေး (ပိတ်ရန် off)",
+      "• summary — on | off · summaryhour — စာရင်းချုပ်ပို့မယ့်နာရီ 0–23 (မူလ ၂၃)",
       "",
       "<b>🛠 Maintenance</b>",
       "<code>/maint on ခဏပြုပြင်နေပါတယ်</code> — Member တွေ စစ်ရင် ဒီစာပြ (Owner က စမ်းလို့ရသေး)",
@@ -1510,13 +1614,12 @@ const ADMIN_PAGES = {
       "<code>/stats</code> — ဒီနေ့+မနေ့က စစ်တာ၊ တွေ့/မတွေ့၊ game အများဆုံး",
       "<code>/summary</code> ဒီနေ့ · <code>/summary 1</code> မနေ့က · <code>/summary week</code> ရက် ၇ ရက်",
       "စစ်တာ၊ Done၊ Admin တစ်ယောက်ချင်း Done ပြ (စစ်တာအရေအတွက်က ၃ ရက်ပဲ သိမ်း၊ Done က ၃၀ ရက်)",
-      "ညဘက် ၉ နာရီ (မြန်မာ) Owner ဆီ အလိုလိုပို့ — <code>/set summaryhour 22</code> · <code>/set summary off</code> (Cron နဲ့ OWNER_IDS လို)",
+      "ည ၁၁ နာရီ (မြန်မာ) Owner ဆီ အလိုလိုပို့ — <code>/set summaryhour 22</code> · <code>/set summary off</code> (Cron နဲ့ OWNER_IDS လို)",
       "",
       "<b>📝 Post တင် (Channel / Group)</b> — Bot နဲ့ private chat မှာ Owner",
-      "/start ရိုက်ရင် Menu ခလုတ်တွေ အောက်မှာ ပေါ်နေမယ် — 📝 Post တင်ရန် · ⏰ Schedule · 🗂 တင်ပြီးသား · 📋 Templates · 📢 Channels",
-      "Post ခလုတ်တွေ: Button + 🎨 Color (အပြာ/အစိမ်း/အနီ) · 📌 Pin · 🔔 Silent · 🔗 Link preview · 📸 Album · 💾 Template · Preview · ယခုတင် / အချိန်ခွဲ (🔁 နေ့တိုင်း/အပတ်တိုင်း)",
+      "/start ရိုက်ရင် Menu ခလုတ်တွေ အောက်မှာ ပေါ်နေမယ် — 📝 Post တင်ရန် · ⏰ Schedule · 📢 Channels",
+      "Post ခလုတ်တွေ: Button + 🎨 Color (အပြာ/အစိမ်း/အနီ) · 📌 Pin · 🔔 Silent · 🔗 Link preview · 📸 Album · Preview · ယခုတင် / အချိန်ခွဲ (🔁 နေ့တိုင်း/အပတ်တိုင်း)",
       "Channel မှတ်ရန်: Bot ကို channel မှာ admin လုပ်ရုံ (အလိုလိုမှတ်) (သို့) 📢 Channels ထဲက ➕ ခလုတ်နဲ့ @username ထည့် — forward မလိုပါ",
-      "တင်ပြီးသား Post ကို ✏️ စာပြင် / 🖼 ပုံ-video ပြောင်း / 🔘 Button ထည့်-ပြင်-ဖျက် / 🗑 ဖျက် / 📌 Pin ရ (ရက် ၃၀) · Schedule အတွက် Cron နဲ့ KV လို",
       "",
       "<b>📣 Group အားလုံးကို ကြေညာ</b>",
       "Bot နဲ့ private chat မှာ <code>/announce စာသား</code> — Bot သုံးနေတဲ့ group အားလုံးဆီ ပို့၊ ပြီးရင် ဘယ်နှစ်ခုရောက်လဲ ပြန်ပြော",
@@ -1524,12 +1627,12 @@ const ADMIN_PAGES = {
     ].join("\n")],
 };
 // Blue buttons, two per row. h:a = this menu, h:a1..a6 = pages (admins only), h:0 = back to the /start menu.
-const adminMenu = () => {
-  const b = (k) => ({ text: ADMIN_PAGES[k][0], callback_data: "h:" + k, style: "primary" });
-  return { inline_keyboard: [[b("a1"), b("a2")], [b("a3"), b("a4")], [b("a5"), b("a6")], [b("a7"), b("a8")], [{ text: "⬅️ ပြန်သွားရန်", callback_data: "h:0", style: "primary" }]] };
+const adminRows = () => {
+  const b = (k) => ({ text: ADMIN_PAGES[k][0], data: "h:" + k, style: "primary" });
+  return [[b("a1"), b("a2")], [b("a3"), b("a4")], [b("a5"), b("a6")], [b("a7"), b("a8")], [{ text: "⬅️ ပြန်သွားရန်", data: "h:0", style: "primary" }]];
 };
 async function adminCommand(env, m, text, isGroup, owners) {
-  const mm = text.match(/^\/(lock|unlock|hidegame|showgame|announce|groups|addalias|delalias|aliases|settings|set|maint|seticon|emojiid|summary|addcmd|delcmd|cmds|setwelcome|welcome|captcha|addword|delword|words|stats|paymsg|payword|delpayword|paywords|addfaq|delfaq|faqs|setstore|setdone|adminhelp|orders|warns|unwarn|unban)(?:@\w+)?(?:\s+([\s\S]*))?$/i);
+  const mm = text.match(/^\/(lock|unlock|hidegame|showgame|announce|groups|addalias|delalias|aliases|settings|set|maint|seticon|emojiid|summary|addcmd|delcmd|cmds|setwelcome|welcome|captcha|addword|delword|words|stats|paymsg|payword|delpayword|paywords|addfaq|delfaq|faqs|setstore|setdone|adminhelp|orders|warns|unwarn|unban|pkgs|setpkg|delpkg)(?:@\w+)?(?:\s+([\s\S]*))?$/i);
   if (!mm) return false;
   const cmd = mm[1].toLowerCase();
   const arg = (mm[2] || "").trim();
@@ -1537,7 +1640,7 @@ async function adminCommand(env, m, text, isGroup, owners) {
   const uid = m.from?.id;
   const isOwner = owners.includes(String(uid));
   if (!isOwner && !(isGroup && (await isAdmin(env, chat, uid)))) return true;
-  if (["set", "settings", "maint", "seticon", "emojiid", "summary", "hidegame", "showgame", "announce", "groups"].includes(cmd) && !isOwner) return true;   // owner only
+  if (["set", "settings", "maint", "seticon", "emojiid", "summary", "hidegame", "showgame", "announce", "groups", "pkgs", "setpkg", "delpkg"].includes(cmd) && !isOwner) return true;   // owner only
   const say = (t, ms = 10 * 60 * 1000) => sendCard({ ...env, replyTo: 0 }, chat, t, {}, ms);
   const usage = (t) => say(t, 2 * 60 * 1000);
   if (cmd === "adminhelp") {
@@ -1746,6 +1849,47 @@ async function adminCommand(env, m, text, isGroup, owners) {
           "\n<code>/maint on စာသား</code> · <code>/maint off</code>"
       );
     }
+    return true;
+  }
+
+  // ----- package short codes (owner): /pkgs /setpkg /delpkg -----
+  if (cmd === "pkgs" || cmd === "setpkg" || cmd === "delpkg") {
+    const pa = arg.split(/\s+/).filter(Boolean);
+    const groups = await loadGroups(env);
+    let g = null;
+    if (pa[0]) {
+      const a = abbrGroups(groups, pa[0], true);
+      const f = a.length === 1 ? a : findGroups(groups, pa[0]);
+      if (f.length === 1) g = f[0];
+    }
+    if (!g) {
+      await usage("ဥပမာ:\n<code>/pkgs ml</code> — အတိုကောက်စာရင်း\n<code>/setpkg ml wp = weekly pass</code> — အတိုကောက်ပြင်/ထည့် (= နောက်က package နာမည်ရဲ့ တစ်စိတ်)\n<code>/delpkg ml wp</code> — ဖျက်");
+      return true;
+    }
+    const pks = (await freshPackages(env, g)).flatMap((e) => e.packages).filter((p) => p && p.g2bulk && Number(p.price) > 0);
+    if (cmd === "pkgs") {
+      const seen = new Set(), cnt = {};
+      pks.forEach((p) => { const s = pkgShort(g.key, p); const k = s + "|" + p.amount; if (!seen.has(k)) { seen.add(k); cnt[s] = (cnt[s] || 0) + 1; } });
+      const lines = [...seen].map((k) => { const [s, a] = k.split("|"); return `<code>${esc(s)}</code>${cnt[s] > 1 ? " ⚠️" : ""} → ${esc(a)}`; });
+      await say(`🏷 <b>${esc(g.name)}</b> — အတိုကောက်\n\n` + (lines.join("\n") || "package မတွေ့ပါ") + "\n\n⚠️ = တူနေတဲ့ကုဒ် (<code>/setpkg</code> နဲ့ ပြင်ပါ)\nအရေအတွက်: <code>wp2</code> · <code>86x3</code> · <code>86 x3</code>", 5 * 60 * 1000);
+      return true;
+    }
+    if (cmd === "delpkg") {
+      const sh = (pa[1] || "").toLowerCase();
+      if (!sh || !((S.pkgs || {})[g.key] || {})[sh]) { await usage("ဖျက်လို့မရပါ။ <code>/pkgs " + esc(pa[0]) + "</code> နဲ့ ကြည့်ပါ။ (ကိုယ်ပြင်ထားတာပဲ ဖျက်လို့ရ)"); return true; }
+      await saveCfg(env, (c) => { c.pkgs = { ...(c.pkgs || {}) }; c.pkgs[g.key] = { ...(c.pkgs[g.key] || {}) }; delete c.pkgs[g.key][sh]; });
+      await say(`✅ <code>${esc(sh)}</code> ဖျက်ပြီးပါပြီ`, 2 * 60 * 1000);
+      return true;
+    }
+    const sm = arg.match(/^\S+\s+(\S+)\s*=\s*(.+)$/);
+    const sh = sm ? sm[1].toLowerCase() : "";
+    const val = sm ? sm[2].trim().toLowerCase() : "";
+    if (!/^[a-z0-9]{1,10}$/.test(sh) || !val || !pks.some((p) => String(p.amount).toLowerCase().includes(val))) {
+      await usage("ဥပမာ: <code>/setpkg " + esc(pa[0]) + " wp = weekly pass</code>\n(= နောက်က package နာမည်ရဲ့ တစ်စိတ်၊ <code>/pkgs " + esc(pa[0]) + "</code> နဲ့ ကြည့်ပါ)");
+      return true;
+    }
+    await saveCfg(env, (c) => { c.pkgs = { ...(c.pkgs || {}) }; c.pkgs[g.key] = { ...(c.pkgs[g.key] || {}), [sh]: val }; });
+    await say(`✅ <b>${esc(g.name)}</b> — <code>${esc(sh)}</code> → ${esc(val)}`, 2 * 60 * 1000);
     return true;
   }
 
@@ -2126,21 +2270,18 @@ async function adminCommand(env, m, text, isGroup, owners) {
 }
 
 /* ---------- Post composer (owner, private chat): everything is a button ---------- */
-// Main menu (reply keyboard, always visible): Post / Schedule list / Sent posts / Templates / Channels / Help.
+// Main menu (reply keyboard, always visible): Post / Schedule list / Channels / Help.
 // Post flow: pick targets (inline toggles) -> send content (text / photo / video / file, or 📸 Album) -> menu:
-//   link buttons + colors, Pin, Silent, Link preview, Template save, Preview, post now / schedule (+ repeat).
-// Sent posts can be edited later: text / caption, replace the photo-video-file (editMessageMedia), add / replace / delete / recolor link buttons.
-// State lives in KV "pst:<uid>"; scheduled posts "sch:<time>:<id>"; sent posts "sent:<time>:<id>" (30 days, for edit / delete / pin);
-// templates "tpl:<id>"; album parts "alb:<uid>:<message>"; channels "chn:<id>" (register by forwarding a channel post to the bot).
+//   link buttons + colors, Pin, Silent, Link preview, Preview, post now / schedule (+ repeat).
+// State lives in KV "pst:<uid>"; scheduled posts "sch:<time>:<id>"; album parts "alb:<uid>:<message>"; channels "chn:<id>" (register by forwarding a channel post to the bot).
 const PL = {
   add: "➕ Button ထည့်", store: "🏪 Store button", clr: "🧹 Button ရှင်း", prev: "👀 Preview", test: "🧪 Test (ကိုယ့်ဆီပို့)", color: "🎨 Button Color",
   now: "✅ ယခုတင်", later: "⏰ အချိန်ခွဲတင်", cancel: "❌ ပယ်ဖျက်", back: "⬅️ Back",
-  redo: "🔄 Content ပြန်ပို့", album: "📸 Album", done: "✔️ ပြီးပြီ", tpl: "💾 Template သိမ်း",
+  redo: "🔄 Content ပြန်ပို့", album: "📸 Album", done: "✔️ ပြီးပြီ",
 };
-const ML = { new: "📝 Post တင်ရန်", list: "⏰ Schedule စာရင်း", sent: "🗂 တင်ပြီးသား Post", tpl: "📋 Templates", chn: "📢 Channels", help: "ℹ️ အကူအညီ" };
+const ML = { new: "📝 Post တင်ရန်", list: "⏰ Schedule စာရင်း", chn: "📢 Channels", help: "ℹ️ အကူအညီ", bal: "💰 Balance" };
 const POST_HELP_TEXT =
-  "ℹ️ <b>Post တင်နည်း</b>\n\n1️⃣ <b>" + ML.new + "</b> နှိပ် → နေရာရွေး → စာ/ပုံ/video ပို့\n2️⃣ ခလုတ်တွေနဲ့ စီမံ — Button + 🎨 Color၊ 📌 Pin၊ 🔔 Silent၊ 🔗 Link preview၊ 📸 Album၊ 💾 Template\n3️⃣ 👀 Preview ကြည့်ပြီး ✅ ယခုတင် (သို့) ⏰ အချိန်ခွဲတင် (နေ့တိုင်း/အပတ်တိုင်း repeat ရ)\n\n" +
-        "🗂 <b>တင်ပြီးသား Post</b> — ✏️ စာပြင် / 🖼 ပုံ-video ပြောင်း / 🔘 Button ထည့်-ပြင်-ဖျက်-color / ဖျက် / Pin / Unpin\n📋 <b>Templates</b> — သိမ်းထားတာ တစ်ချက်နှိပ်ပြီး ပြန်သုံး\n\n📢 Channel အသစ်: Bot ကို channel မှာ admin လုပ်ရုံ (သို့) 📢 Channels ထဲက ➕ ခလုတ်နဲ့ @username ထည့်\n👥 Group တွေက အလိုလိုမှတ်ပါတယ်";
+  "ℹ️ <b>Post တင်နည်း</b>\n\n1️⃣ ☰ Menu ထဲက <b>/post</b> → နေရာရွေး → စာ/ပုံ/video ပို့\n2️⃣ Button + 🎨 Color၊ 📌 Pin၊ 🔔 Silent၊ 📸 Album\n3️⃣ 👀 Preview ကြည့်ပြီး ✅ ယခုတင် (သို့) ⏰ အချိန်ခွဲတင် (repeat ရ)\n\n📢 Channel: Bot ကို channel မှာ admin လုပ်ရုံ (သို့) 📢 Channels ထဲက ➕\n👥 Group တွေက အလိုလိုမှတ်ပါတယ်";
 const WL = { h1: "⏰ +1 နာရီ", h3: "⏰ +3 နာရီ", night: "🌙 ည ၉ နာရီ", morn: "🌅 မနက် ၉ နာရီ" };
 const RPL = { once: "1️⃣ တစ်ခါတည်း", daily: "🔁 နေ့တိုင်း", weekly: "🔁 အပတ်တိုင်း" };
 const PERIOD = { daily: 86400e3, weekly: 7 * 86400e3 };
@@ -2158,11 +2299,7 @@ const colorOf = (w) => {
 };
 const onoff = (b) => (b ? "✅" : "⬜");
 const kb = (rows) => ({ keyboard: rows, resize_keyboard: true });
-const mainKb = () => ({
-  keyboard: [[{ text: ML.new, style: "success" }, { text: ML.list }], [{ text: ML.sent }, { text: ML.tpl }], [{ text: ML.chn }, { text: ML.help }]],
-  resize_keyboard: true,
-  is_persistent: true,
-});
+const mainKb = () => ({ remove_keyboard: true });   // the owner menu lives in the ☰ Menu button next to the text box (see ensureMenu)
 const NO_KB = mainKb();   // after a post is finished / cancelled the keyboard goes back to the main menu
 const cancelKb = () => kb([[{ text: PL.cancel }]]);
 const backKb = () => kb([[{ text: PL.back }]]);
@@ -2176,9 +2313,9 @@ const postKb = (p) =>
     [{ text: PL.add }, { text: PL.store }],
     [{ text: PL.color }, { text: PL.clr }],
     [{ text: `📌 Pin ${onoff(p.pin)}` }, { text: `🔔 Silent ${onoff(p.silent)}` }],
-    [{ text: `🔗 Link preview ${onoff(!p.nopv)}` }, { text: PL.tpl }],
-    [{ text: PL.redo }, { text: PL.album }],
-    [{ text: PL.prev }, { text: PL.test, style: "primary" }],
+    [{ text: `🔗 Link preview ${onoff(!p.nopv)}` }, { text: PL.redo }],
+    [{ text: PL.album }, { text: PL.prev }],
+    [{ text: PL.test, style: "primary" }],
     [{ text: PL.now, style: "success" }, { text: PL.later, style: "primary" }],
     [{ text: PL.back, style: "primary" }, { text: PL.cancel, style: "danger" }],
   ]);
@@ -2225,39 +2362,6 @@ function parseBtnLines(t) {
   return rows;
 }
 const BTN_FORMAT_HINT = "⚠️ ပုံစံမမှန်ပါ။ တစ်ကြောင်းကို ခလုတ်တစ်ခု:\n<code>နာမည် | https://link</code>\n<code>နာမည် | https://link | green</code>";
-const saveSent = (env, sk, rec) => env.STATE.put(`sent:${sk}`, JSON.stringify(rec), { expirationTtl: 30 * 86400 }).catch(() => {});
-// Put the post's current buttons on every message already sent (an album cannot carry buttons, those are skipped).
-async function applySentMarkup(env, rec) {
-  const rm = postMarkup(rec.post) || { inline_keyboard: [] };   // empty keyboard = remove the buttons
-  let ok = 0, skip = 0, err = "";
-  for (const s of rec.sent) {
-    if (s.m.length !== 1) { skip++; continue; }
-    const r = await tg(env, "editMessageReplyMarkup", { chat_id: s.c, message_id: s.m[0], reply_markup: rm }).catch(() => null);
-    if (r?.ok || /not modified/i.test(r?.description || "")) ok++; else err = err || r?.description || "";
-  }
-  return { ok, skip, err };
-}
-// Button editor screen of a sent post (list + add / replace / delete one / color / clear).
-function btnPanel(rec, sk) {
-  const b = rec.post.btns || [];
-  const col = (Object.values(COLORS).find((c) => c.style === (rec.post.color || "")) || COLORS.none).label;
-  const text =
-    "🔘 <b>Button ပြင်ရန်</b>\n\n" +
-    (b.length ? b.map((x, i) => `${i + 1}. ${esc(x.t)} → ${esc(x.u)}${x.c ? ` (${esc(x.c)})` : ""}`).join("\n") : "Button မရှိသေးပါ") +
-    `\n\n🎨 Color: ${col}` +
-    (rec.sent.some((s) => s.m.length > 1) ? "\n⚠️ Album ပါတဲ့နေရာမှာ Link button မရပါ (Telegram က Album မှာ button မခွင့်ပြုပါ)" : "");
-  const rows = [
-    [{ text: "➕ ထည့်", callback_data: `sa:badd:${sk}`, style: "success" }, { text: "🔄 အားလုံး အစားထိုး", callback_data: `sa:bset:${sk}`, style: "primary" }],
-    ...b.map((x, i) => [{ text: `🗑 ${i + 1}. ${x.t}`.slice(0, 40), callback_data: `sa:bd${i}:${sk}`, style: "danger" }]),
-    [
-      { text: "🔵", callback_data: `sa:bcp:${sk}`, style: "primary" }, { text: "🟢", callback_data: `sa:bcg:${sk}`, style: "success" },
-      { text: "🔴", callback_data: `sa:bcr:${sk}`, style: "danger" }, { text: "⚪", callback_data: `sa:bcn:${sk}` },
-    ],
-    [{ text: "🧹 Button အကုန်ရှင်း", callback_data: `sa:bx:${sk}`, style: "danger" }],
-    closeRow(),
-  ];
-  return { text, rows };
-}
 // One copy of the post to one chat. -> { ok, ids, description }
 async function sendPostTo(env, chat, post, preview = false) {
   const r = await sendPostRaw(env, chat, post, preview);
@@ -2300,14 +2404,6 @@ async function publishPost(env, post) {
   }
   return res;
 }
-// Remember what was sent, so it can be edited / deleted / pinned later from "🗂 တင်ပြီးသား Post".
-async function recordSent(env, post, res, by) {
-  if (!res.sent.length) return;
-  const { targets, ...rest } = post;
-  const t = Date.now();
-  const id = Math.random().toString(36).slice(2, 7);
-  await env.STATE.put(`sent:${t}:${id}`, JSON.stringify({ t, by: by || 0, post: rest, sent: res.sent }), { expirationTtl: 30 * 86400 }).catch(() => {});
-}
 const postReport = (res) =>
   `✅ ${res.ok} နေရာ တင်ပြီးပါပြီ` +
   (res.bad.length ? `\n❌ ${res.bad.length} နေရာ မအောင်မြင်ပါ\n` + res.bad.map((x) => `• <code>${esc(x)}</code>`).join("\n") + "\n(Bot ကို admin + Post messages ခွင့်ပေးထားလား စစ်ပါ)" : "") +
@@ -2340,7 +2436,6 @@ async function sweepSched(env) {
     await env.STATE.delete(k.name).catch(() => {});   // delete first so overlapping sweeps send it once
     if (!post) continue;
     const res = await publishPost(env, post);
-    await recordSent(env, post, res, post.by);
     let note = "";
     if (post.rep && PERIOD[post.rep]) {   // repeat: queue the next run (same id)
       let next = Number(at) + PERIOD[post.rep];
@@ -2403,30 +2498,29 @@ async function postFlow(env, m) {
   if (t === ML.new) t = "/post";            // main-menu buttons act as the commands
   else if (t === ML.list) t = "/posts";
   else if (t === ML.chn) t = "/channels";
-  else if (t === ML.sent) t = "/sent";
-  else if (t === ML.tpl) t = "/templates";
   const key = `pst:${uid}`;
   const say = (txt, extra = {}) => send({ ...env, replyTo: 0 }, chat, txt, extra);
+  if (t === ML.bal) { await showBalance({ ...env, replyTo: 0 }, chat); return true; }
   if (t === ML.help) {   // the same menu /start shows, called from the keyboard; ❌ ပိတ် deletes it
     await junkSweep(env, chat);
-    await say(MENU_TEXT, { reply_markup: helpMenu(true, true) });
+    await sendUi({ ...env, replyTo: 0 }, chat, MENU_TEXT, helpRows(true, true));
     return true;
   }
   let st = await env.STATE.get(key, "json").catch(() => null);
   const save = () => env.STATE.put(key, JSON.stringify(st), { expirationTtl: 6 * 3600 });
 
   // register a channel: forward any post of it to the bot (only when not busy writing a post)
-  if (m.forward_origin?.type === "channel" && m.forward_origin.chat && (!st || !["content", "edit"].includes(st.step))) {
+  if (m.forward_origin?.type === "channel" && m.forward_origin.chat && (!st || !["content"].includes(st.step))) {
     const c = m.forward_origin.chat;
     await env.STATE.put("chn:" + c.id, String(c.title || c.username || c.id).slice(0, 60));
     await say(`📢 Channel မှတ်ပြီးပါပြီ: <b>${esc(c.title || c.username || c.id)}</b>\n<code>${c.id}</code>\nBot ကို အဲဒီ channel မှာ admin (Post / Edit / Delete / Pin messages ခွင့်) ပေးထားပါ။\n(နောက်ကျရင် forward မလိုပါ — Bot ကို admin လုပ်ရုံနဲ့ အလိုလိုမှတ်ပါတယ်)`, { reply_markup: mainKb() });
     return true;
   }
 
-  const cm = t.match(/^\/(post|posts|sent|templates|delpost|addchannel|delchannel|channels)(?:@\w+)?(?:\s+([\s\S]*))?$/i);
+  const cm = t.match(/^\/(post|posts|delpost|addchannel|delchannel|channels)(?:@\w+)?(?:\s+([\s\S]*))?$/i);
   if (cm) {
     const cmd = cm[1].toLowerCase(), arg = (cm[2] || "").trim();
-    if (t !== raw.trim() || ["post", "posts", "sent", "templates", "channels"].includes(cmd)) await junkSweep(env, chat);   // a menu button / command clears the older screens
+    if (t !== raw.trim() || ["post", "posts", "channels"].includes(cmd)) await junkSweep(env, chat);   // a menu button / command clears the older screens
     if (cmd === "post") { await beginPost(env, chat, uid, null); return true; }
     if (cmd === "channels") {
       const l = await env.STATE.list({ prefix: "chn:", limit: 100 });
@@ -2470,36 +2564,11 @@ async function postFlow(env, m) {
       await say("🗑 Schedule post ဖျက်ပြီးပါပြီ");
       return true;
     }
-    if (cmd === "sent") {   // last 10 posts the bot sent: tap one to edit / delete / pin
-      const l = await env.STATE.list({ prefix: "sent:", limit: 1000 });
-      const keys = l.keys.slice(-10).reverse();
-      const btns = [];
-      for (const k of keys) {
-        const rec = await env.STATE.get(k.name, "json").catch(() => null);
-        if (!rec) continue;
-        const prev = plainTpl(rec.post.html).replace(/\s+/g, " ").slice(0, 25) || (rec.post.media ? `(${rec.post.media.type})` : "");
-        btns.push([{ text: `${whenLabel(rec.t)} · ${prev}`.slice(0, 60), callback_data: `sm:${k.name.slice(5)}`, style: "primary" }]);
-      }
-      await say(btns.length ? "🗂 <b>တင်ပြီးသား Post</b> (နောက်ဆုံး ၁၀ ခု)\nရွေးပါ 👇" : "🗂 တင်ပြီးသား Post မရှိသေးပါ (ရက် ၃၀ သိမ်းပါတယ်)", { reply_markup: { inline_keyboard: [...btns, closeRow()] } });
-      return true;
-    }
-    if (cmd === "templates") {
-      const l = await env.STATE.list({ prefix: "tpl:", limit: 50 });
-      const btns = [];
-      for (const k of l.keys) {
-        const tp = await env.STATE.get(k.name, "json").catch(() => null);
-        if (!tp) continue;
-        const id = k.name.slice(4);
-        btns.push([{ text: `📄 ${tp.name}`.slice(0, 40), callback_data: `tu:${id}`, style: "primary" }, { text: "🗑", callback_data: `td:${id}`, style: "danger" }]);
-      }
-      await say(btns.length ? "📋 <b>Templates</b>\nအသုံးပြုချင်တာ နှိပ်ပါ (🗑 = ဖျက်) 👇" : "📋 Template မရှိသေးပါ\nPost တစ်ခုပြင်ဆင်ပြီး <b>" + PL.tpl + "</b> နှိပ်ရင် သိမ်းပေးပါမယ်", { reply_markup: { inline_keyboard: [...btns, closeRow()] } });
-      return true;
-    }
   }
 
   if (!st) return false;
   // ❌ ပယ်ဖျက် = leave everything. ⬅️ Back on the first / single-screen steps leaves too (nothing to lose there).
-  if (t === PL.cancel || (t === PL.back && ["target", "edit", "addch", "editmedia", "editbtn"].includes(st.step))) {
+  if (t === PL.cancel || (t === PL.back && ["target", "addch"].includes(st.step))) {
     if (st.step === "album") await clearAlbum(env, uid);
     await env.STATE.delete(key).catch(() => {});
     await say("❌ ပယ်ဖျက်လိုက်ပါပြီ", { reply_markup: NO_KB });
@@ -2522,7 +2591,7 @@ async function postFlow(env, m) {
     await say(`📢 Channel မှတ်ပြီးပါပြီ: <b>${esc(r.result.title)}</b>` + (cmr.result.can_post_messages === false ? "\n⚠️ Post messages ခွင့် မရှိသေးပါ" : "\n📝 Post တင်ရန် နဲ့ ရွေးလို့ရပါပြီ"), { reply_markup: NO_KB });
     return true;
   }
-  if (t.startsWith("/") && !["content", "edit", "editmedia"].includes(st.step)) return false;   // other commands keep working
+  if (t.startsWith("/") && !["content"].includes(st.step)) return false;   // other commands keep working
 
   const post = st.post || newPost();
   const menu = (txt) => say(txt, { reply_markup: postKb(post) });
@@ -2556,7 +2625,7 @@ async function postFlow(env, m) {
       st.step = "when";
       await save();
       await say("⬅️ အချိန်ပြန်ရွေးပါ 👇", { reply_markup: whenKb() });
-    } else {   // buttons / color / tplname / when -> post menu
+    } else {   // buttons / color / when -> post menu
       st.step = "menu";
       await save();
       await menu("⬅️ ပြန်ရောက်ပါပြီ");
@@ -2626,102 +2695,6 @@ async function postFlow(env, m) {
       return true;   // silent: just collecting
     }
     await say("ပုံ / video ပို့ပါ၊ ပြီးရင် <b>" + PL.done + "</b> နှိပ်ပါ", { reply_markup: albumKb() });
-    return true;
-  }
-
-  // ----- replace the photo / video / file of an already sent post -----
-  if (st.step === "editmedia") {
-    const rec = await env.STATE.get(`sent:${st.sk}`, "json").catch(() => null);
-    if (!rec) { await env.STATE.delete(key).catch(() => {}); await say("⚠️ ဒီ post မတွေ့တော့ပါ", { reply_markup: NO_KB }); return true; }
-    if (m.media_group_id) { await say("ပုံ/video တစ်ခုတည်း ပို့ပါ (Album အစုလိုက် မရပါ)"); return true; }
-    let media = null;
-    if (m.photo?.length) media = { type: "photo", id: m.photo[m.photo.length - 1].file_id };
-    else if (m.video) media = { type: "video", id: m.video.file_id };
-    else if (m.animation) media = { type: "animation", id: m.animation.file_id };
-    else if (m.document) media = { type: "document", id: m.document.file_id };
-    if (!media) { await say("ပုံ / video / GIF / file တစ်ခု ပို့ပါ (စာသားတင် ပို့လို့မရပါ)"); return true; }
-    if (raw.length > 1000) { await say("⚠️ Caption က စာလုံး ၁၀၀၀ ထက် မကျော်ရပါ"); return true; }
-    const html = raw ? richHtml(raw, m.caption_entities || [], 0, 1000) : rec.post.html || "";   // no new caption -> keep the old one
-    let ok = 0, err = "", album = false;
-    for (const s of rec.sent) {
-      const isAlbum = s.m.length > 1;
-      if (isAlbum) album = true;
-      const rm = isAlbum ? undefined : postMarkup(rec.post);   // keep the buttons
-      const r = await tg(env, "editMessageMedia", {
-        chat_id: s.c, message_id: s.m[0],
-        media: { type: media.type, media: media.id, caption: tplHtml(html), parse_mode: "HTML" },
-        ...(rm ? { reply_markup: rm } : {}),
-      }).catch(() => null);
-      if (r?.ok) ok++; else err = err || r?.description || "";
-    }
-    if (ok) {
-      rec.post.media = media;
-      rec.post.html = html;
-      await saveSent(env, st.sk, rec);
-    }
-    await env.STATE.delete(key).catch(() => {});
-    await say(`🖼 အစားထိုးပြီးပါပြီ — ✅ ${ok}/${rec.sent.length} နေရာ` + (album ? "\n(Album ဆိုရင် ပထမပုံ/video တစ်ခုတည်း အစားထိုးတာပါ)" : "") + (err ? `\n⚠️ ${esc(err)}` : ""), { reply_markup: NO_KB });
-    return true;
-  }
-
-  // ----- add / replace the link buttons of an already sent post -----
-  if (st.step === "editbtn") {
-    const rec = await env.STATE.get(`sent:${st.sk}`, "json").catch(() => null);
-    if (!rec) { await env.STATE.delete(key).catch(() => {}); await say("⚠️ ဒီ post မတွေ့တော့ပါ", { reply_markup: NO_KB }); return true; }
-    const rows = m.text ? parseBtnLines(t) : [];
-    if (!rows.length) { await say(BTN_FORMAT_HINT); return true; }
-    rec.post.btns = (st.mode === "add" ? [...(rec.post.btns || []), ...rows] : rows).slice(0, 8);
-    const r = await applySentMarkup(env, rec);
-    if (r.ok) await saveSent(env, st.sk, rec);
-    await env.STATE.delete(key).catch(() => {});
-    await say(
-      `🔘 ✅ ${r.ok}/${rec.sent.length - r.skip} နေရာ ပြင်ပြီး (Button ${r.ok ? rec.post.btns.length : (rec.post.btns || []).length} ခု)` +
-        (r.skip ? `\n⚠️ Album ${r.skip} နေရာမှာ Button မရပါ` : "") + (r.err ? `\n⚠️ ${esc(r.err)}` : ""),
-      { reply_markup: NO_KB }
-    );
-    const cur = r.ok ? rec : (await env.STATE.get(`sent:${st.sk}`, "json").catch(() => null)) || rec;
-    const pn = btnPanel(cur, st.sk);
-    await say(pn.text, { reply_markup: { inline_keyboard: pn.rows } });
-    return true;
-  }
-
-  // ----- edit an already sent post (from 🗂 တင်ပြီးသား Post) -----
-  if (st.step === "edit") {
-    const rec = await env.STATE.get(`sent:${st.sk}`, "json").catch(() => null);
-    if (!rec) { await env.STATE.delete(key).catch(() => {}); await say("⚠️ ဒီ post မတွေ့တော့ပါ", { reply_markup: NO_KB }); return true; }
-    if (!m.text) { await say("စာသားပဲ ပို့ပါ (ပုံ/video ပြောင်းချင်ရင် ❌ နှိပ်ပြီး 🗂 တင်ပြီးသား Post → 🖼 ပုံ/Video ပြောင်း ကို သုံးပါ)"); return true; }
-    const mediaPost = !!rec.post.media;
-    if (mediaPost && raw.length > 1000) { await say("⚠️ Caption က စာလုံး ၁၀၀၀ ထက် မကျော်ရပါ"); return true; }
-    const html = richHtml(raw, m.entities || [], 0, mediaPost ? 1000 : 3500);
-    let ok = 0, err = "";
-    for (const s of rec.sent) {
-      const rm = s.m.length === 1 ? postMarkup(rec.post) : undefined;   // keep the buttons on the edited message
-      const common = { chat_id: s.c, message_id: s.m[0], parse_mode: "HTML", ...(rm ? { reply_markup: rm } : {}) };
-      const r = mediaPost
-        ? await tg(env, "editMessageCaption", { ...common, caption: tplHtml(html) }).catch(() => null)
-        : await tg(env, "editMessageText", { ...common, text: tplHtml(html), ...(rec.post.nopv ? { link_preview_options: { is_disabled: true } } : {}) }).catch(() => null);
-      if (r?.ok) ok++; else err = err || r?.description || "";
-    }
-    if (ok) {
-      rec.post.html = html;
-      await env.STATE.put(`sent:${st.sk}`, JSON.stringify(rec), { expirationTtl: 30 * 86400 }).catch(() => {});
-    }
-    await env.STATE.delete(key).catch(() => {});
-    await say(`✏️ ပြင်ပြီးပါပြီ — ✅ ${ok}/${rec.sent.length} နေရာ` + (err ? `\n⚠️ ${esc(err)}` : ""), { reply_markup: NO_KB });
-    return true;
-  }
-
-  // ----- template name -----
-  if (st.step === "tplname") {
-    const name = t.slice(0, 30);
-    if (!name || !m.text) { await say("Template နာမည် (စာသား) ပို့ပါ"); return true; }
-    const l = await env.STATE.list({ prefix: "tpl:", limit: 100 });
-    if (l.keys.length >= 30) { st.step = "menu"; await save(); await menu("⚠️ Template ၃၀ ခုထက် မသိမ်းနိုင်ပါ၊ 📋 Templates မှာ တချို့ဖျက်ပါ"); return true; }
-    const { targets, ...rest } = post;
-    await env.STATE.put("tpl:" + Math.random().toString(36).slice(2, 7), JSON.stringify({ name, post: rest }));
-    st.step = "menu";
-    await save();
-    await menu(`💾 Template "${esc(name)}" သိမ်းပြီးပါပြီ\n📋 Templates ကနေ နောက်ကျရင် တစ်ချက်နှိပ်ပြီး သုံးနိုင်ပါတယ်`);
     return true;
   }
 
@@ -2796,13 +2769,6 @@ async function postFlow(env, m) {
   if (t.startsWith("📌 Pin")) { post.pin = !post.pin; await save(); await menu(`📌 Pin: ${post.pin ? "ဖွင့် — တင်ပြီးရင် channel/group မှာ pin လုပ်ပေးမယ်" : "ပိတ်"}`); return true; }
   if (t.startsWith("🔔 Silent")) { post.silent = !post.silent; await save(); await menu(`🔔 Silent: ${post.silent ? "ဖွင့် — အသံမမြည်ဘဲ တင်မယ်" : "ပိတ်"}`); return true; }
   if (t.startsWith("🔗 Link preview")) { post.nopv = !post.nopv; await save(); await menu(`🔗 Link preview: ${post.nopv ? "ပိတ်" : "ဖွင့်"}` + (post.media ? "\n(ပုံ/video post မှာ မသက်ရောက်ပါ)" : "")); return true; }
-  if (t === PL.tpl) {
-    if (!ready()) { await menu("⚠️ Post မှာ ဘာမှမရှိသေးပါ"); return true; }
-    st.step = "tplname";
-    await save();
-    await say("💾 Template နာမည်ပေးပါ (ဥပမာ: Promo၊ ဈေးနှုန်း၊ Maintenance)", { reply_markup: backKb() });
-    return true;
-  }
   if (t === PL.redo) {
     st.step = "content";
     await save();
@@ -2887,106 +2853,6 @@ async function postCallback(q, env) {
     await ans("🗑 ဖျက်ပြီးပါပြီ", false);
     return dropRow();
   }
-  if (tag === "td") {
-    await env.STATE.delete("tpl:" + parts[1]).catch(() => {});
-    await ans("🗑 Template ဖျက်ပြီးပါပြီ", false);
-    const rows = (q.message.reply_markup?.inline_keyboard || []).filter((r) => !r.some((b) => b.callback_data === q.data));
-    return tg(env, "editMessageReplyMarkup", { chat_id: chat, message_id: q.message.message_id, reply_markup: { inline_keyboard: rows } });
-  }
-  if (tag === "tu") {
-    const tp = await env.STATE.get("tpl:" + parts[1], "json").catch(() => null);
-    if (!tp) return ans("Template မတွေ့ပါ");
-    await ans();
-    return beginPost(env, chat, uid, tp.post);
-  }
-
-  // ----- sent posts -----
-  if (tag === "sm" || tag === "sa") {
-    const act = tag === "sa" ? parts[1] : "";
-    const sk = parts.slice(tag === "sa" ? 2 : 1).join(":");
-    const rec = await env.STATE.get(`sent:${sk}`, "json").catch(() => null);
-    if (!rec) return ans("ဒီ post မတွေ့တော့ပါ");
-    if (tag === "sm") {
-      await ans(null);
-      const p = rec.post;
-      const prev = esc(plainTpl(p.html).replace(/\s+/g, " ").slice(0, 150) || (p.media ? `(${p.media.type}${p.album?.length ? " + album" : ""})` : ""));
-      const rows = [
-        [{ text: "✏️ စာပြင်", callback_data: `sa:edit:${sk}`, style: "primary" }, { text: "🗑 ဖျက်", callback_data: `sa:del:${sk}`, style: "danger" }],
-        [...(p.media ? [{ text: "🖼 ပုံ/Video ပြောင်း", callback_data: `sa:media:${sk}`, style: "primary" }] : []), { text: "🔘 Button", callback_data: `sa:btn:${sk}`, style: "primary" }],
-        [{ text: "📌 Pin", callback_data: `sa:pin:${sk}`, style: "success" }, { text: "📍 Unpin", callback_data: `sa:unpin:${sk}` }],
-      ];
-      rec.sent.slice(0, 4).forEach((s, i) => {
-        if (String(s.c).startsWith("-100") && s.m[0]) rows.push([{ text: `🔗 Post ဖွင့်ကြည့်${rec.sent.length > 1 ? " " + (i + 1) : ""}`, url: `https://t.me/c/${String(s.c).slice(4)}/${s.m[0]}` }]);
-      });
-      rows.push(closeRow());
-      return say(`🗂 <b>${whenLabel(rec.t)}</b> · ${rec.sent.length} နေရာ\n\n${prev}`, { reply_markup: { inline_keyboard: rows } });
-    }
-    if (act === "edit") {
-      await env.STATE.put(key, JSON.stringify({ step: "edit", sk }), { expirationTtl: 6 * 3600 });
-      await ans(null);
-      return say("✏️ စာအသစ် ပို့ပါ (နေရာအားလုံးမှာ အစားထိုးမယ်၊ Button တွေ မပျောက်ပါ)" + (rec.post.media ? "\n(ပုံ/video ရဲ့ caption ကိုပဲ ပြင်တာပါ — ပုံပြောင်းချင်ရင် 🖼 ပုံ/Video ပြောင်း)" : ""), { reply_markup: cancelKb() });
-    }
-    if (act === "media") {
-      if (!rec.post.media) return ans("စာသားချည်းပဲ Post မှာ ပုံ/video ထည့်လို့မရပါ (Telegram က စာ message ကို ပုံ message အဖြစ် မပြောင်းပေးပါ)၊ Post အသစ်တင်ပါ");
-      await env.STATE.put(key, JSON.stringify({ step: "editmedia", sk }), { expirationTtl: 6 * 3600 });
-      await ans(null);
-      return say("🖼 ပုံ / video / GIF / file အသစ် ပို့ပါ (နေရာအားလုံးမှာ အစားထိုးမယ်၊ Button တွေ မပျောက်ပါ)\n• Caption ပါရင် caption အသစ်၊ မပါရင် မူလ caption ကို ဆက်သုံးမယ်" + (rec.sent.some((s) => s.m.length > 1) ? "\n• Album ဆိုရင် ပထမတစ်ခုပဲ အစားထိုးမယ်" : ""), { reply_markup: cancelKb() });
-    }
-    if (act === "btn") {
-      await ans(null);
-      const pn = btnPanel(rec, sk);
-      return say(pn.text, { reply_markup: { inline_keyboard: pn.rows } });
-    }
-    if (act === "badd" || act === "bset") {
-      await env.STATE.put(key, JSON.stringify({ step: "editbtn", sk, mode: act === "badd" ? "add" : "set" }), { expirationTtl: 6 * 3600 });
-      await ans(null);
-      return say(
-        (act === "badd" ? "➕ Button အသစ်ထည့်မယ်" : "🔄 Button အားလုံးကို အစားထိုးမယ်") + " — တစ်ကြောင်းကို တစ်ခု ပို့ပါ (အများဆုံး ၈ ခု):\n<code>နာမည် | https://link</code>\n<code>နာမည် | https://link | green</code>\n(color: blue / green / red)",
-        { reply_markup: cancelKb() }
-      );
-    }
-    if (/^b[dcx]/.test(act)) {   // bd<N> = delete button N, bc<p|g|r|n> = color, bx = clear all
-      const p = rec.post;
-      if (act.startsWith("bd")) {
-        const i = Number(act.slice(2));
-        if (!(p.btns || [])[i]) return ans("ဒီ Button မတွေ့တော့ပါ");
-        p.btns.splice(i, 1);
-      } else if (act === "bx") {
-        p.btns = [];
-      } else {
-        const style = { bcp: "primary", bcg: "success", bcr: "danger", bcn: "" }[act];
-        if (style === undefined) return ans(null);
-        p.color = style;
-        p.btns = (p.btns || []).map((b) => ({ ...b, c: "" }));   // one color for all, same as when writing a post
-      }
-      const r = await applySentMarkup(env, rec);
-      if (r.ok) await saveSent(env, sk, rec);
-      await ans(`🔘 ${r.ok}/${rec.sent.length - r.skip} နေရာ ပြင်ပြီး` + (r.skip ? `\n(Album ${r.skip} နေရာ မပါ)` : "") + (r.err ? "\n" + r.err : ""), false);
-      const cur = r.ok ? rec : (await env.STATE.get(`sent:${sk}`, "json").catch(() => null)) || rec;
-      const pn = btnPanel(cur, sk);
-      return tg(env, "editMessageText", { chat_id: chat, message_id: q.message.message_id, text: pn.text, parse_mode: "HTML", reply_markup: { inline_keyboard: pn.rows } }).catch(() => {});
-    }
-    if (act === "del") {
-      let ok = 0, err = "";
-      for (const s of rec.sent) {
-        const r = await tg(env, "deleteMessages", { chat_id: s.c, message_ids: s.m }).catch(() => null);
-        if (r?.ok) ok++; else err = err || r?.description || "";
-      }
-      if (ok === rec.sent.length) await env.STATE.delete(`sent:${sk}`).catch(() => {});
-      await ans(`🗑 ${ok}/${rec.sent.length} နေရာ ဖျက်ပြီး${err ? "\n" + err : ""}`);
-      return tg(env, "editMessageText", { chat_id: chat, message_id: q.message.message_id, text: `🗑 ဖျက်ပြီး — ${ok}/${rec.sent.length} နေရာ` + (err ? `\n⚠️ ${esc(err)}` : ""), parse_mode: "HTML" });
-    }
-    if (act === "pin" || act === "unpin") {
-      let ok = 0, err = "";
-      for (const s of rec.sent) {
-        const r = await tg(env, act === "pin" ? "pinChatMessage" : "unpinChatMessage", { chat_id: s.c, message_id: s.m[0], ...(act === "pin" ? { disable_notification: true } : {}) }).catch(() => null);
-        if (r?.ok) ok++; else err = err || r?.description || "";
-      }
-      return ans(`${act === "pin" ? "📌 Pin" : "📍 Unpin"} ${ok}/${rec.sent.length} နေရာ${err ? "\n" + err : ""}`);
-    }
-    return ans(null);
-  }
-
   // ----- final confirmation before posting -----
   if (tag === "pk") {
     const s2 = await env.STATE.get(key, "json").catch(() => null);
@@ -2998,9 +2864,8 @@ async function postCallback(q, env) {
     await env.STATE.delete(key).catch(() => {});   // first, so a double tap posts once
     await ans("⏳ တင်နေပါတယ်...", false);
     const res = await publishPost(env, s2.post);
-    await recordSent(env, s2.post, res, uid);
     await tg(env, "editMessageReplyMarkup", { chat_id: chat, message_id: q.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => {});
-    return say(postReport(res) + (res.ok ? "\n\n🗂 တင်ပြီးသား Post ကနေ ပြင်/ဖျက်လို့ရ" : ""), { reply_markup: NO_KB });
+    return say(postReport(res), { reply_markup: NO_KB });
   }
 
   // ----- target picker -----
@@ -3012,16 +2877,11 @@ async function postCallback(q, env) {
   else if (gid === "ok") {
     if (!st.sel.length) return ans("နေရာ အနည်းဆုံး ၁ ခု ရွေးပါ");
     st.post.targets = st.sel;
-    const pre = !!(st.post.html || st.post.media);   // a template already has its content
-    st.step = pre ? "menu" : "content";
+    st.step = "content";
     await env.STATE.put(key, JSON.stringify(st), { expirationTtl: 6 * 3600 });
     await ans(null);
     const names = targets.filter((x) => st.sel.includes(x.id)).map((x) => `${x.kind} ${esc(x.title)}`).join("\n");
     await tg(env, "editMessageText", { chat_id: chat, message_id: q.message.message_id, text: `📝 <b>တင်မယ့်နေရာ</b>\n${names}`, parse_mode: "HTML" });
-    if (pre) {
-      await sendPostTo(env, chat, st.post, true).catch(() => {});
-      return say("📋 Template ဖွင့်ပြီးပါပြီ — အောက်က ခလုတ်တွေနဲ့ ဆက်လုပ်ပါ (စာပြင်ချင်ရင် 🔄 Content ပြန်ပို့)", { reply_markup: postKb(st.post) });
-    }
     return say(CONTENT_TEXT, { reply_markup: contentKb() });
   } else if (targets.some((x) => x.id === gid)) st.sel = st.sel.includes(gid) ? st.sel.filter((x) => x !== gid) : [...st.sel, gid];
   await env.STATE.put(key, JSON.stringify(st), { expirationTtl: 6 * 3600 });
@@ -3029,40 +2889,731 @@ async function postCallback(q, env) {
   return tg(env, "editMessageReplyMarkup", { chat_id: chat, message_id: q.message.message_id, reply_markup: targetKb(targets, st.sel) });
 }
 
+/* ---------- Rich UI (Bot API 10.3): table + button grid in one message, replaces the inline keyboards ---------- */
+// Buttons are written once as { text, data | url, style } rows; sendUi() sends them as a rich message
+// (every label cut / padded to the same length, so the buttons look even) and falls back to a normal inline keyboard.
+const CLOSE_BTN = { text: "❌ ပိတ်", data: "pz:c", style: "danger" };
+const qa = (s) => esc(String(s)).replace(/"/g, "&quot;");
+const vlen = (s) => [...String(s)].filter((c) => !/\p{M}/u.test(c)).length;
+function fitLabel(t, n) {
+  let out = "", v = 0, cut = false;
+  for (const ch of String(t)) {
+    const w = /\p{M}/u.test(ch) ? 0 : 1;
+    if (v + w > n) { cut = true; break; }
+    out += ch; v += w;
+  }
+  if (cut) { out = out.replace(/\s+$/, "") + "…"; v = vlen(out); }
+  const pad = Math.max(0, n - v);
+  return "\u2800".repeat(Math.floor(pad / 2)) + out + "\u2800".repeat(Math.ceil(pad / 2));
+}
+const evenRows = (rows, n = 14) => rows.filter((r) => r.length).map((r) => r.map((b) => ({ ...b, text: fitLabel(b.text, n) })));
+const toInline = (rows) => rows.map((r) => r.map((b) => ({ text: b.text, ...(b.url ? { url: b.url } : { callback_data: b.data }), ...(b.style ? { style: b.style } : {}) })));
+const rbtn = (b) => `<tg-button type="${b.url ? "url" : "callback_data"}"${b.style ? ` style="${b.style}"` : ""} ${b.url ? `url="${qa(b.url)}"` : `data="${qa(b.data)}"`}>${esc(b.text)}</tg-button>`;
+const rrows = (rows) => rows.map((r) => `<tg-button-row align="center">${r.map(rbtn).join("")}</tg-button-row>`).join("");
+// Telegram-HTML text (b / i / code, \n) -> rich paragraphs
+const htmlToRich = (h) => String(h).split(/\n+/).map((l) => l.trim()).filter(Boolean).map((l) => `<p>${l}</p>`).join("");
+async function sendUi(env, chat, html, rows, ms, n = 14) {
+  let rs = evenRows(rows, n);
+  if (env.bc) {   // Chat automation: only link buttons are used (no callback buttons, no rich message)
+    rs = rs.map((r) => r.filter((b) => b.url)).filter((r) => r.length);
+    return sendCard(env, chat, html, rs.length ? { reply_markup: { inline_keyboard: toInline(rs) } } : {}, ms);
+  }
+  if (S.rich !== "off" && !/<blockquote/.test(html)) {
+    const r = await tg(env, "sendRichMessage", {
+      chat_id: chat,
+      rich_message: { html: htmlToRich(html) + rrows(rs) },
+      ...(env.replyTo ? { reply_parameters: { message_id: env.replyTo, allow_sending_without_reply: true } } : {}),
+    }).catch(() => null);
+    if (r?.ok) {
+      if (Number(chat) < 0) await scheduleDelete(env, chat, r.result?.message_id, ms);
+      return r;
+    }
+  }
+  return sendCard(env, chat, html, { reply_markup: { inline_keyboard: toInline(rs) } }, ms);
+}
+
+/* ---------- Package price quote ("ml 86 x3" -> total), order preview, change, USD <-> Ks ---------- */
+// Customers never see the cost price: only the selling price (package.price). Cost is kept for the owner's daily summary.
+const fmtKs = (n) => Math.round(Number(n) || 0).toLocaleString("en-US");
+// ["86", "x3", "wp2", "50+x2"] -> { want: [{ tok, qty }], bad: [tok] }   (same token rules as the admin buy message)
+function wantFromTokens(entries, gkey, toks) {
+  const want = [], bad = [];
+  for (const raw of toks) {
+    const r = String(raw).toLowerCase();
+    let mm;
+    if ((mm = r.match(/^x(\d{1,2})$/)) && want.length) { want[want.length - 1].qty = Number(mm[1]); continue; }
+    if (pickPackage(entries, r, gkey, true)) { want.push({ tok: r, qty: 1 }); continue; }
+    mm = r.match(/^(\d+\+?)x(\d{1,2})$/) || r.match(/^([a-z]+)(\d{1,2})$/);
+    if (mm && pickPackage(entries, mm[1], gkey, true)) { want.push({ tok: mm[1], qty: Number(mm[2]) }); continue; }
+    bad.push(r);
+  }
+  const merged = [];
+  for (const w of want) { const p = merged.find((y) => y.tok === w.tok); if (p) p.qty += w.qty; else merged.push({ ...w }); }
+  return { want: merged, bad };
+}
+// -> { items: [{ tok, qty, p, unit, sub }], bad: [tok], total, cost }   cost = 0 when any package has no cost price
+function quoteOf(entries, gkey, want) {
+  const items = [], bad = [];
+  let total = 0, cost = 0, costOk = true;
+  for (const w of want) {
+    const hit = w.qty >= 1 && w.qty <= 99 ? pickPackage(entries, w.tok, gkey, true) : null;
+    if (!hit) { bad.push(w.tok); continue; }
+    const unit = Number(hit.p.price) || 0, c = Number(hit.p.cost) || 0;
+    items.push({ tok: w.tok, qty: w.qty, p: hit.p, unit, sub: unit * w.qty });
+    total += unit * w.qty;
+    if (c > 0) cost += c * w.qty; else costOk = false;
+  }
+  return { items, bad, total, cost: costOk ? cost : 0 };
+}
+const quoteLines = (q) => q.items.map((x) => `${esc(String(x.p.amount))}${x.qty > 1 ? ` ×${x.qty}` : ""} — ${fmtKs(x.sub)} Ks`).join("\n");
+// "ml 86 x3 wp" -> { group, entries, quote } ; null when the message is not exactly "<game> <packages>" (chatter stays untouched)
+async function parseQuote(env, text) {
+  const toks = buyTokens(text);
+  if (toks.length < 2 || toks.length > 14 || toks.some((t) => /^\d{5,}$/.test(t))) return null;
+  const groups = await loadGroups(env);
+  for (const k of [1, 2]) {
+    const hit = abbrGroups(groups, toks.slice(0, k).join(" "), true);
+    if (hit.length !== 1) continue;
+    const group = hit[0];
+    const entries = (await loadPackages(env)).get(group.key) || [];
+    if (!entries.length) return null;
+    const rest = toks.slice(k).filter((t) => !BUY_FILLER.test(t));
+    if (!rest.length) return null;
+    const { want, bad } = wantFromTokens(entries, group.key, rest);
+    if (bad.length || !want.length) return null;
+    const quote = quoteOf(entries, group.key, want);
+    if (quote.bad.length || !quote.items.length) return null;
+    return { group, entries, quote };
+  }
+  return null;
+}
+async function sendQuote(env, chat, q) {
+  const html = `🎮 <b>${esc(q.group.name)}</b>\n\n${quoteLines(q.quote)}\n━━━━━━━━\n💰 <b>Total: ${fmtKs(q.quote.total)} Ks</b>`;
+  const copy = { text: "Copy", copy_text: { text: String(Math.round(q.quote.total)) }, style: "primary", ...ic(env, "ICON_COPY") };
+  return sendCard(env, chat, html, { reply_markup: { inline_keyboard: [[copy]] } });
+}
+const adminTags = async (env, chat) => {
+  const r = await tg(env, "getChatAdministrators", { chat_id: chat }).catch(() => null);
+  return (r?.result || []).filter((a) => a.user && !a.user.is_bot).slice(0, 10).map((a) => `<a href="tg://user?id=${a.user.id}">${esc(a.user.first_name || "Admin")}</a>`).join(" ");
+};
+
+// Customer order message: "ml 123456789 2002 86 x3" (same format the admins use to buy). Not bought: the ID is checked and the card
+// also shows the packages + total. The same ID + package sent again within 10 minutes is flagged (admins are tagged in groups).
+async function orderPreview(env, m, chat, plan, isGroup) {
+  const { group, orders } = plan;
+  const entries = (await loadPackages(env)).get(group.key) || plan.entries;
+  const todo = [], probs = [];
+  for (const o of orders) {
+    if (o.err) { probs.push(`${o.id || o.line.slice(0, 30)} — ${o.err}`); continue; }
+    const qt = quoteOf(entries, group.key, o.want);
+    if (qt.bad.length) probs.push(`${o.id} — Package မတွေ့: ${qt.bad.join(" ")}`);
+    else todo.push({ o, qt });
+  }
+  if (probs.length) await sendCard(env, chat, `⚠️ <b>${esc(group.name)}</b>\n${probs.map((x) => esc(x)).join("\n")}\n\n<code>/pkgs ${esc(group.key)}</code> နဲ့ package အတိုကောက် ကြည့်နိုင်ပါတယ်`);
+  for (const { o, qt } of todo.slice(0, 5)) {
+    let warn = "";
+    if (env.STATE) {
+      const sig = `opv:${chat}:${group.key}:${o.id}:${o.server}:${o.want.map((w) => w.tok + "x" + w.qty).join(",")}`;
+      const prev = Number(await env.STATE.get(sig).catch(() => 0)) || 0;
+      await env.STATE.put(sig, String(Date.now()), { expirationTtl: 600 }).catch(() => {});
+      if (prev) {
+        const mins = Math.max(1, Math.round((Date.now() - prev) / 60000));
+        warn = `⚠️ <b>ထပ်နေပါတယ်</b> — ဒီ ID / package ကို ${mins} မိနစ်အလိုက ပို့ပြီးသား` + (isGroup ? `\n${await adminTags(env, chat)}` : "");
+        if (!isGroup) await notifyOwners(env, `⚠️ <b>Order ထပ်နေ</b>\n${esc(group.name)} <code>${esc(o.id)}${o.server ? `(${esc(o.server)})` : ""}</code> — ${mins} မိနစ်အတွင်း ထပ်ပို့ထားတယ်`).catch(() => {});
+      }
+    }
+    const html = `📦 ${quoteLines(qt)}\n💰 <b>Total: ${fmtKs(qt.total)} Ks</b>` + (warn ? `\n\n${warn}` : "");
+    await runCheck({ ...env, orderExtra: { html, price: qt.total, cost: qt.cost, n: qt.items.length } }, chat, group, o.id, o.server);
+  }
+  return true;
+}
+
+// ----- change ("paid 50000 price 45000") and USD <-> Ks -----
+const CH_PAID = "(?:paid|pay|ပေး(?:ငွေ)?|လက်ခံ(?:ငွေ)?)";
+const CH_PRICE = "(?:price|total|bill|cost|ဈေး|ကျငွေ|ကျ|စုစုပေါင်း)";
+function calcChangeParse(line) {
+  const s = String(line || "").trim();
+  let m = s.match(new RegExp(`^${CH_PAID}\\s*[:=]?\\s*(.+?)\\s+${CH_PRICE}\\s*[:=]?\\s*(.+)$`, "iu"));
+  if (m) return { paid: m[1], price: m[2] };
+  m = s.match(new RegExp(`^${CH_PRICE}\\s*[:=]?\\s*(.+?)\\s+${CH_PAID}\\s*[:=]?\\s*(.+)$`, "iu"));
+  return m ? { paid: m[2], price: m[1] } : null;
+}
+// -> { paid, price, diff } ; the price may also be a package list ("ml 86 x3")
+async function calcChangeEval(env, c) {
+  const amount = async (s, allowQuote) => {
+    try { return calcEval(calcNormalize(s)).v; }
+    catch (e) {
+      if (!allowQuote) throw e;
+      const q = await parseQuote(env, s);
+      if (q) return q.quote.total;
+      throw e;
+    }
+  };
+  const paid = await amount(c.paid, false), price = await amount(c.price, true);
+  return { paid, price, diff: paid - price };
+}
+function calcChangeHtml(r) {
+  const head = r.diff > 0 ? `<b>ပြန်အမ်း: ${fmtKs(r.diff)} Ks</b>` : r.diff === 0 ? "✅ <b>အတိအကျ ပေးထားပါတယ်</b>" : `⚠️ <b>ငွေ လိုနေသေး: ${fmtKs(-r.diff)} Ks</b>`;
+  return `💵 <b>ပြန်အမ်းငွေ</b>\nပေးငွေ: ${fmtKs(r.paid)} Ks\nဈေး: ${fmtKs(r.price)} Ks\n━━━━━━━━\n${head}`;
+}
+const CUR_WORD = "(?:usd|dollars?|mmk|ks|kyat|ကျပ်|\\$)";
+const curOf = (w) => (/^(?:usd|dollars?|\$)$/i.test(w) ? "usd" : /^(?:mmk|ks|kyat|ကျပ်)$/i.test(w) ? "mmk" : "");
+function calcCurrencyParse(line) {
+  const m = String(line || "").trim().match(new RegExp(`^(\\$)?\\s*([\\d.,]+\\s*[kKmM]?)\\s*(${CUR_WORD})?\\s*(?:to|in|into|->|=>|→|=)\\s*(${CUR_WORD})$`, "iu"));
+  if (!m) return null;
+  const from = m[1] ? "usd" : curOf(m[3] || ""), to = curOf(m[4]);
+  if (!from || !to || from === to) return null;
+  try { return { x: calcEval(calcNormalize(m[2])).v, from, to }; } catch { return null; }
+}
+const calcCurrencyOut = (c, rate) => {
+  const y = c.from === "usd" ? c.x * rate : c.x / rate;
+  const a = calcFmt(c.x).pretty, b = calcFmt(Math.round(y * 100) / 100).pretty;
+  return { y, text: c.from === "usd" ? `${a} USD = ${b} Ks` : `${a} Ks = ${b} USD`, rate };
+};
+
+/* ---------- HTTP API for other chat-automation tools (Messenger / Viber / n8n / Make / your own site) ---------- */
+// Needs the secret API_KEY. Send it as header "x-api-key: <key>" (or "Authorization: Bearer <key>", or ?key=<key> for quick tests).
+//   GET|POST /api/calc?q=5000+3000*2                      calculator (expression, "20% of 5000", "5 km to mi", "paid 50000 price 45000", "50 usd to mmk")
+//   GET|POST /api/check?game=ml&id=123456789&server=2002  player name + region (server only for games that need one)
+//   GET|POST /api/price?game=ml                           package list with selling prices (no cost)
+//   GET|POST /api/quote?game=ml&items=86x3,wp             total price of the packages
+//   GET|POST /api/order?game=ml&id=...&server=...&items=86x3   name check + total in one call
+// POST bodies are JSON with the same field names. Every answer is JSON: { ok: true, ... } or { ok: false, error }.
+const API_RL = new Map();
+const timingEq = (a, b) => {
+  a = String(a); b = String(b);
+  let d = a.length ^ b.length;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) d |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  return d === 0;
+};
+async function apiGame(env, q) {
+  const groups = await loadGroups(env);
+  let hit = abbrGroups(groups, q, true);
+  if (hit.length !== 1) hit = findGroups(groups, q);
+  return hit.length === 1 ? hit[0] : null;
+}
+async function apiCalc(env, q) {
+  const lines = String(q || "").split(/\n+/).map((x) => x.trim()).filter(Boolean).slice(0, 16);
+  if (!lines.length) return { ok: false, error: "q is empty" };
+  const results = [];
+  let total = 0;
+  for (const line of lines) {
+    try {
+      const conv = lines.length === 1 ? calcConvert(line) : null;
+      if (conv) { results.push({ type: "unit", input: line, text: conv.text, value: Number(conv.plain) }); continue; }
+      const chg = calcChangeParse(line);
+      if (chg) { const r = await calcChangeEval(env, chg); results.push({ type: "change", input: line, paid: r.paid, price: r.price, change: r.diff, value: r.diff, text: calcChangeHtml(r).replace(/<[^>]+>/g, "") }); continue; }
+      const cur = calcCurrencyParse(line);
+      if (cur) {
+        const rate = await storeRate(env);
+        if (!rate) { results.push({ type: "currency", input: line, error: "USD rate not available" }); continue; }
+        const o = calcCurrencyOut(cur, rate);
+        results.push({ type: "currency", input: line, text: o.text, value: o.y, rate });
+        continue;
+      }
+      const r = calcEval(calcNormalize(line));
+      total += r.v;
+      results.push({ type: "expr", input: line, value: r.v, pretty: calcFmt(r.v).pretty });
+    } catch (e) {
+      if (!(e instanceof CalcErr)) throw e;
+      results.push({ type: "error", input: line, error: e.message, detail: e.what || undefined });
+    }
+  }
+  const first = results[0];
+  return { ok: !results.every((r) => r.type === "error"), results, ...(lines.length > 1 ? { total, total_pretty: calcFmt(total).pretty } : { result: first.value ?? null, pretty: first.pretty || first.text || null }) };
+}
+function apiItems(entries, gkey, raw) {
+  const toks = buyTokens(String(raw || "").replace(/,/g, " ")).filter((t) => !BUY_FILLER.test(t));
+  const { want, bad } = wantFromTokens(entries, gkey, toks);
+  const q = quoteOf(entries, gkey, want);
+  return { q, bad: [...bad, ...q.bad] };
+}
+const apiQuoteJson = (q) => ({
+  items: q.items.map((x) => ({ code: x.tok, amount: String(x.p.amount), qty: x.qty, unit_price: x.unit, subtotal: x.sub })),
+  total: q.total,
+  total_pretty: fmtKs(q.total) + " Ks",
+});
+async function apiCheck(env, group, id, server) {
+  if (!id) return { ok: false, error: "id is required" };
+  let pick = null;
+  if (group.dropdown) {
+    pick = pickServer(group, server);
+    if (!pick) return { ok: false, error: "server is required", servers: dropOptions(group).map((o) => o.label) };
+    server = pick.label;
+  } else if (group.idOnly) server = "";
+  else if (!server) return { ok: false, error: "server is required" };
+  const results = pick
+    ? [{ g: pick.entry, r: await callProvider(pick.entry, id, pick.value) }]
+    : await Promise.all(group.entries.map(async (g) => ({ g, r: await callProvider(g, id, server) })));
+  const valid = results.filter((x) => x.r.outcome === "valid");
+  if (valid.length) {
+    const best = valid.find(({ g, r }) => r.geo && r.geo.region && String(g.serverName || "").trim().toLowerCase() === r.geo.region.toLowerCase()) || valid[0];
+    const region = fmtRegion((best.r.geo && best.r.geo.region) || regionFromServerId(best.g.g2bulkCode, server));
+    return { ok: true, found: true, game: group.name, id, server: server || "", name: best.r.name, region, country: (best.r.geo && best.r.geo.country) || "", provider: best.r.provider || "", all_names: [...new Set(valid.map((x) => x.r.name))] };
+  }
+  if (results.every((x) => x.r.outcome === "unknown")) return { ok: false, error: "provider busy, try again", providers: [...new Set(results.map((x) => x.r.provider).filter(Boolean))] };
+  if (results.some((x) => x.r.outcome === "skip") && !results.some((x) => x.r.outcome === "invalid")) return { ok: false, error: "this game has no name check" };
+  return { ok: true, found: false, game: group.name, id, server: server || "", reason: results.some((x) => x.r.reason === "server") ? "server" : "id" };
+}
+async function apiHandle(req, env, url) {
+  const cors = { "access-control-allow-origin": "*", "access-control-allow-headers": "content-type,x-api-key,authorization", "access-control-allow-methods": "GET,POST,OPTIONS" };
+  const out = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json; charset=utf-8", ...cors } });
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+  if (!env.API_KEY) return out({ ok: false, error: "API is off: set the API_KEY secret" }, 503);
+  let body = {};
+  if (req.method === "POST") { try { body = (await req.json()) || {}; } catch { body = {}; } }
+  const key = req.headers.get("x-api-key") || (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "") || url.searchParams.get("key") || body.key || "";
+  if (!timingEq(key, env.API_KEY)) return out({ ok: false, error: "unauthorized" }, 401);
+  const now = Date.now(), rl = API_RL.get("k") || { t: now, n: 0 };
+  if (now - rl.t > 60000) { rl.t = now; rl.n = 0; }
+  if (++rl.n > 120) { API_RL.set("k", rl); return out({ ok: false, error: "too many requests (120 per minute)" }, 429); }
+  API_RL.set("k", rl);
+  const arg = (k) => String(body[k] ?? url.searchParams.get(k) ?? "").trim();
+  try {
+    const path = url.pathname.replace(/\/+$/, "");
+    if (path === "/api/health") return out({ ok: true, time: now });
+    if (path === "/api/calc") return out(await apiCalc(env, arg("q") || arg("text") || arg("expression")));
+    const needGame = async () => {
+      const g = await apiGame(env, arg("game"));
+      return g ? { g, entries: (await loadPackages(env)).get(g.key) || [] } : null;
+    };
+    if (path === "/api/check" || path === "/api/price" || path === "/api/quote" || path === "/api/order") {
+      const gm = await needGame();
+      if (!gm) return out({ ok: false, error: "game not found (or more than one match): send the short name or the full name" }, 404);
+      const { g, entries } = gm;
+      if (path === "/api/check") return out(await apiCheck(env, g, arg("id"), arg("server")));
+      if (path === "/api/price") {
+        const list = [];
+        for (const e of entries) for (const p of e.packages) if (priced(p)) list.push({ code: pkgShort(g.key, p), amount: String(p.amount), price: Number(p.price), region: e.server || "" });
+        return out({ ok: true, game: g.name, packages: list });
+      }
+      const { q, bad } = apiItems(entries, g.key, arg("items"));
+      if (bad.length || !q.items.length) return out({ ok: false, error: "package not found", not_found: bad }, 404);
+      if (path === "/api/quote") return out({ ok: true, game: g.name, ...apiQuoteJson(q) });
+      const chk = await apiCheck(env, g, arg("id"), arg("server"));
+      return out({ ...chk, order: apiQuoteJson(q) });
+    }
+    return out({ ok: false, error: "unknown endpoint" }, 404);
+  } catch (e) {
+    console.error("api", e);
+    return out({ ok: false, error: "server error" }, 500);
+  }
+}
+
+/* ---------- Calculator ---------- */
+// Plain messages that look like a calculation ("5000+3000*2", "20% of 5000", "5k*3", "2^10", "sqrt(144)") are answered with the result,
+// and /calc <expression> always works. Several lines = one calculation per line + a total. Units: "5 km to mi", "100 f to c", "2 viss to kg".
+// Setting: /set calc auto|cmd|off   (auto = answer by itself, cmd = only /calc, off = no calculator).
+/* CALC-PURE-START */
+class CalcErr extends Error {}
+const CALC_BURMESE = [["သိန်း", 1e5], ["သောင်း", 1e4], ["ထောင်", 1e3], ["သန်း", 1e6], ["ကုဋေ", 1e7]];
+function calcNormalize(raw) {
+  let s = String(raw || "").replace(/[၀-၉]/g, (c) => "၀၁၂၃၄၅၆၇၈၉".indexOf(c));
+  s = s.replace(/[−–—]/g, "-").replace(/[×✕✖✗⋅∙]/g, "*").replace(/÷/g, "/").replace(/＋/g, "+").replace(/（/g, "(").replace(/）/g, ")").replace(/＝/g, "=");
+  s = s.replace(/\*\*/g, "^");
+  s = s.replace(/(\d|\))\s*[xX]\s*(?=[\d(.])/g, "$1*");                      // 86x3, 5 x 4
+  s = s.replace(/(\d)\s*(?:percent|pct)\b/gi, "$1%");                          // 20 percent
+  s = s.replace(/(\d)\s*%\s*of\s+/gi, "$1%*");                                 // 20% of 5000
+  s = s.replace(/\$|ကျပ်|(?<=\d)\s*(?:ks|mmk|usd)\b/gi, "");                   // currency marks
+  if (!/[A-Za-z_]\w*\s*\(/.test(s)) s = s.replace(/(\d),(?=\d{3}(?!\d))/g, "$1"); // 1,000,000 (not inside max(1,000))
+  return s.replace(/\s*=\s*\??\s*$/, "").replace(/^\s*=\s*/, "").trim();
+}
+function calcFn(name, a, fail) {
+  const n = (k) => { if (a.length !== k) fail("args", name); };
+  const one = (f) => { n(1); return f(a[0]); };
+  const int = (x) => { if (!Number.isInteger(x) || x < 0) fail("math"); return x; };
+  const gcd = (x, y) => { x = Math.abs(x); y = Math.abs(y); while (y) [x, y] = [y, x % y]; return x; };
+  switch (name) {
+    case "sqrt": return one(Math.sqrt);
+    case "cbrt": return one(Math.cbrt);
+    case "abs": return one(Math.abs);
+    case "floor": return one(Math.floor);
+    case "ceil": return one(Math.ceil);
+    case "trunc": return one(Math.trunc);
+    case "sign": return one(Math.sign);
+    case "round": { if (a.length === 2) { const f = 10 ** Math.max(0, Math.min(12, Math.trunc(a[1]))); return Math.round((a[0] + Number.EPSILON) * f) / f; } return one(Math.round); }
+    case "ln": return one(Math.log);
+    case "log": case "log10": { if (a.length === 2) return Math.log(a[0]) / Math.log(a[1]); return one(Math.log10); }
+    case "log2": return one(Math.log2);
+    case "exp": return one(Math.exp);
+    case "sin": return one(Math.sin);
+    case "cos": return one(Math.cos);
+    case "tan": return one(Math.tan);
+    case "asin": return one(Math.asin);
+    case "acos": return one(Math.acos);
+    case "atan": return one(Math.atan);
+    case "rad": return one((x) => (x * Math.PI) / 180);
+    case "deg": return one((x) => (x * 180) / Math.PI);
+    case "pow": n(2); return Math.pow(a[0], a[1]);
+    case "mod": n(2); if (a[1] === 0) fail("div0"); return a[0] % a[1];
+    case "hypot": if (!a.length) fail("args", name); return Math.hypot(...a);
+    case "min": if (!a.length) fail("args", name); return Math.min(...a);
+    case "max": if (!a.length) fail("args", name); return Math.max(...a);
+    case "sum": if (!a.length) fail("args", name); return a.reduce((x, y) => x + y, 0);
+    case "avg": case "mean": if (!a.length) fail("args", name); return a.reduce((x, y) => x + y, 0) / a.length;
+    case "fact": return one((x) => { int(x); if (x > 170) fail("overflow"); let r = 1; for (let i = 2; i <= x; i++) r *= i; return r; });
+    case "gcd": if (a.length < 2) fail("args", name); return a.map(int).reduce(gcd);
+    case "lcm": if (a.length < 2) fail("args", name); return a.map(int).reduce((x, y) => (x && y ? (x / gcd(x, y)) * y : 0));
+    // store helpers: disc(price, pct) = price after discount, vat/tax(price, pct) = price + pct, pctof(a, b) = a is what % of b, pchange(old, new) = % change
+    case "disc": case "discount": n(2); return a[0] * (1 - a[1] / 100);
+    case "vat": case "tax": case "markup": n(2); return a[0] * (1 + a[1] / 100);
+    case "pctof": n(2); if (a[1] === 0) fail("div0"); return (a[0] / a[1]) * 100;
+    case "pchange": n(2); if (a[0] === 0) fail("div0"); return ((a[1] - a[0]) / Math.abs(a[0])) * 100;
+    default: fail("unknown", name);
+  }
+}
+// -> { v, ops, nums }. ops = operators / functions / % used, nums = numbers and constants read (used to tell a calculation from chatter).
+function calcEval(s, ans) {
+  let i = 0, depth = 0, ops = 0, nums = 0;
+  const fail = (code, what) => { const e = new CalcErr(code); e.what = what || ""; throw e; };
+  const ok = (x) => { if (!Number.isFinite(x)) fail("math"); return x; };
+  const peek = () => { while (i < s.length && /\s/.test(s[i])) i++; return s[i] || ""; };
+  const unitAt = (t) => CALC_BURMESE.find(([w]) => t.startsWith(w));
+
+  function number() {
+    const m = s.slice(i).match(/^(?:0[xX][0-9a-fA-F]+|0[bB][01]+|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)/);
+    if (!m) fail("syntax");
+    const t = m[0];
+    i += t.length;
+    nums++;
+    let v = /^0[xX]/.test(t) ? parseInt(t, 16) : /^0[bB]/.test(t) ? parseInt(t.slice(2), 2) : parseFloat(t);
+    const sfx = s.slice(i).match(/^([kKmMbB])(?![A-Za-z])/);   // 5k, 2.5m, 1b (attached to the number)
+    if (sfx) { v *= { k: 1e3, m: 1e6, b: 1e9 }[sfx[1].toLowerCase()]; i += 1; ops++; return v; }
+    const u = unitAt(s.slice(i).trimStart());               // 5သိန်း 3သောင်း 2ထောင် = 530,000 + 2,000
+    if (u) {
+      i = s.length - s.slice(i).trimStart().length + u[0].length;
+      let total = v * u[1], last = u[1];
+      for (;;) {
+        const mm = s.slice(i).match(/^\s*(\d+(?:\.\d+)?)\s*/);
+        if (!mm) break;
+        const rest = s.slice(i + mm[0].length);
+        const u2 = unitAt(rest);
+        if (!u2 || u2[1] >= last) break;
+        total += parseFloat(mm[1]) * u2[1]; last = u2[1]; i += mm[0].length + u2[0].length; nums++;
+      }
+      ops++;
+      return total;
+    }
+    return v;
+  }
+  function primary() {
+    const c = peek();
+    if (c === "(") {
+      i++;
+      if (++depth > 40) fail("syntax");
+      const r = expr();
+      if (peek() !== ")") fail("paren");
+      i++; depth--;
+      return { v: r.v };
+    }
+    if (/[\d.]/.test(c)) return { v: number() };
+    if (/[A-Za-z_]/.test(c)) {
+      const word = s.slice(i).match(/^[A-Za-z_]\w*/)[0];
+      i += word.length;
+      const name = word.toLowerCase();
+      if (peek() === "(") {
+        i++;
+        if (++depth > 40) fail("syntax");
+        const args = [];
+        if (peek() === ")") i++;
+        else for (;;) {
+          args.push(expr().v);
+          const d = peek();
+          if (d === "," || d === ";") { i++; continue; }
+          if (d === ")") { i++; break; }
+          fail("paren");
+        }
+        depth--; ops++;
+        return { v: ok(calcFn(name, args, fail)) };
+      }
+      if (name === "pi") { nums++; return { v: Math.PI }; }
+      if (name === "e") { nums++; return { v: Math.E }; }
+      if (name === "tau") { nums++; return { v: 2 * Math.PI }; }
+      if (name === "ans") { if (ans === undefined) fail("noans"); nums++; return { v: ans }; }
+      fail("unknown", word);
+    }
+    fail("syntax");
+  }
+  function postfix() {
+    let r = primary();
+    for (;;) {
+      const c = peek();
+      if (c === "!") { i++; ops++; r = { v: ok(calcFn("fact", [r.v], fail)) }; continue; }
+      if (c === "%") {
+        const save = i;
+        i++;
+        const nx = peek();
+        if (nx && /[\d(.A-Za-z]/.test(nx) && !/^of\b/i.test(s.slice(i))) { i = save; break; }   // "10 % 3" = remainder
+        ops++;
+        r = { v: r.v / 100, p: true, raw: r.v };
+        continue;
+      }
+      break;
+    }
+    return r;
+  }
+  function power() {
+    const b = postfix();
+    if (peek() === "^") { i++; ops++; const e = unary(); return { v: ok(Math.pow(b.v, e.v)) }; }
+    return b;
+  }
+  function unary() {
+    const c = peek();
+    if (c === "-") { i++; return { v: -unary().v }; }
+    if (c === "+") { i++; return unary(); }
+    return power();
+  }
+  function term() {
+    let a = unary();
+    for (;;) {
+      const c = peek();
+      if (c === "*" || c === "/") {
+        i++; ops++;
+        const b = unary();
+        if (c === "/" && b.v === 0) fail("div0");
+        a = { v: ok(c === "*" ? a.v * b.v : a.v / b.v) };
+        continue;
+      }
+      if (c === "%" || /^mod\b/i.test(s.slice(i))) {
+        i += c === "%" ? 1 : 3; ops++;
+        const b = unary();
+        if (b.v === 0) fail("div0");
+        a = { v: ok(a.v % b.v) };
+        continue;
+      }
+      if (c === "(" || (/[A-Za-z_]/.test(c) && !/^(?:mod|of)\b/i.test(s.slice(i)))) {   // 2(3+4), 3pi
+        ops++;
+        const b = unary();
+        a = { v: ok(a.v * b.v) };
+        continue;
+      }
+      break;
+    }
+    return a;
+  }
+  function expr() {
+    let a = term();
+    for (;;) {
+      const c = peek();
+      if (c !== "+" && c !== "-") break;
+      i++; ops++;
+      const b = term();
+      const bv = b.p ? (a.v * b.raw) / 100 : b.v;   // 5000 + 10% = 5500, 5000 - 10% = 4500
+      a = { v: ok(c === "+" ? a.v + bv : a.v - bv) };
+    }
+    return a;
+  }
+  if (!s) fail("syntax");
+  const r = expr();
+  if (peek()) fail("syntax");
+  return { v: ok(r.v), ops, nums };
+}
+// 12,345.6 -> "12,345.6" ; plain = the same without commas (for Copy)
+function calcFmt(n) {
+  if (Object.is(n, -0)) n = 0;
+  const abs = Math.abs(n);
+  let t;
+  if (abs !== 0 && (abs >= 1e15 || abs < 1e-9)) t = n.toExponential(8).replace(/\.?0+e/, "e").replace("e+", "e");
+  else {
+    t = Number.isInteger(n) ? String(n) : String(Number(n.toPrecision(12)));
+    if (/e/.test(t)) t = n.toFixed(12).replace(/\.?0+$/, "");
+  }
+  if (/e/.test(t)) return { pretty: t, plain: t };
+  const neg = t[0] === "-";
+  const [ip, fp] = t.replace("-", "").split(".");
+  const pretty = (neg ? "-" : "") + ip.replace(/\B(?=(\d{3})+(?!\d))/g, ",") + (fp ? "." + fp : "");
+  return { pretty, plain: t };
+}
+// Unit conversion: "5 km to mi", "100 f to c", "2 viss to kg", "1.5gb in mb" -> { text, plain } or null
+const CALC_UNITS = {
+  length: { m: 1, mm: 0.001, cm: 0.01, km: 1000, in: 0.0254, ft: 0.3048, yd: 0.9144, mi: 1609.344 },
+  mass: { kg: 1, g: 0.001, mg: 1e-6, lb: 0.45359237, oz: 0.028349523125, viss: 1.63293 },
+  volume: { l: 1, ml: 0.001, gal: 3.785411784, floz: 0.0295735295625 },
+  data: { b: 1, kb: 1024, mb: 1048576, gb: 1073741824, tb: 1099511627776 },
+  time: { s: 1, min: 60, h: 3600, d: 86400, wk: 604800 },
+  temp: { c: 1, f: 1, k: 1 },
+};
+const CALC_UNIT_ALIAS = {
+  meter: "m", meters: "m", metre: "m", metres: "m", millimeter: "mm", centimeter: "cm", kilometer: "km", kilometers: "km", kms: "km",
+  inch: "in", inches: "in", foot: "ft", feet: "ft", yard: "yd", yards: "yd", mile: "mi", miles: "mi",
+  kilo: "kg", kilos: "kg", kilogram: "kg", kilograms: "kg", gram: "g", grams: "g", pound: "lb", pounds: "lb", lbs: "lb", ounce: "oz", ounces: "oz",
+  ပိဿာ: "viss", liter: "l", litre: "l", liters: "l", litres: "l", gallon: "gal", gallons: "gal",
+  byte: "b", bytes: "b", sec: "s", second: "s", seconds: "s", minute: "min", minutes: "min", hr: "h", hour: "h", hours: "h", day: "d", days: "d", week: "wk", weeks: "wk",
+  celsius: "c", "°c": "c", "ºc": "c", fahrenheit: "f", "°f": "f", "ºf": "f", kelvin: "k",
+};
+const calcUnit = (u) => {
+  const x = String(u || "").toLowerCase().replace(/\.$/, "");
+  const k = CALC_UNIT_ALIAS[x] || x;
+  const cat = Object.keys(CALC_UNITS).find((c) => k in CALC_UNITS[c]);
+  return cat ? { cat, k } : null;
+};
+function calcConvert(line) {
+  const m = String(line || "").trim().match(/^(-?\d[\d,]*\.?\d*|-?\.\d+)\s*([A-Za-z°º\u1000-\u109F]+)\s+(?:to|into|in|->|=>|→|=)\s+([A-Za-z°º\u1000-\u109F]+)$/i);
+  if (!m) return null;
+  const a = calcUnit(m[2]), b = calcUnit(m[3]);
+  if (!a || !b || a.cat !== b.cat) return null;
+  const x = parseFloat(m[1].replace(/,/g, ""));
+  if (!Number.isFinite(x)) return null;
+  let y;
+  if (a.cat === "temp") {
+    const c = a.k === "c" ? x : a.k === "f" ? ((x - 32) * 5) / 9 : x - 273.15;
+    y = b.k === "c" ? c : b.k === "f" ? (c * 9) / 5 + 32 : c + 273.15;
+  } else y = (x * CALC_UNITS[a.cat][a.k]) / CALC_UNITS[a.cat][b.k];
+  const name = (u) => (u.cat === "temp" ? (u.k === "k" ? "K" : "°" + u.k.toUpperCase()) : u.k);
+  const fx = calcFmt(x), fy = calcFmt(y);
+  return { text: `${fx.pretty} ${name(a)} = ${fy.pretty} ${name(b)}`, plain: fy.plain };
+}
+/* CALC-PURE-END */
+
+const CALC_ANS = new Map();   // user id -> last result (the word "ans")
+const CALC_ERR = {
+  div0: "သုညနဲ့ စားလို့မရပါ",
+  overflow: "ဂဏန်း ကြီးလွန်းပါတယ်",
+  math: "တွက်လို့မရတဲ့ တန်ဖိုးပါ (ဥပမာ အနုတ်ကို square root)",
+  paren: "ကွင်းစ ကွင်းပိတ် မကိုက်ပါ",
+  syntax: "ပုံစံ မမှန်ပါ",
+  noans: "ရှေ့က ရလဒ် မရှိသေးပါ",
+};
+const CALC_HELP =
+  "<b>🧮 Calculator</b>\n" +
+  "• <code>5000+3000*2</code>  <code>(15000-2500)/5</code>\n" +
+  "• %: <code>20% of 5000</code>  <code>5000+10%</code>  <code>5000-15%</code>\n" +
+  "• အတိုကောက်: <code>5k*3</code>  <code>2m</code>  <code>2သိန်း 5သောင်း</code>\n" +
+  "• <code>2^10</code>  <code>10!</code>  <code>17 mod 5</code>  <code>sqrt(144)</code>  <code>pi*5^2</code>\n" +
+  "• <code>round(10/3, 2)</code>  <code>min(3,9)</code>  <code>avg(10,20,30)</code>  <code>ans*2</code>\n" +
+  "• ဆိုင်သုံး: <code>disc(50000,10)</code> (လျှော့ပြီး)  <code>vat(50000,5)</code> (တိုးပြီး)\n  <code>pctof(30,200)</code> (၃၀ က ၂၀၀ ရဲ့ ဘယ်နှ %)  <code>pchange(100,125)</code>\n" +
+  "• Unit: <code>5 km to mi</code>  <code>100 f to c</code>  <code>2 viss to kg</code>  <code>1.5 gb to mb</code>\n" +
+  "• စာကြောင်းများများ ရေးရင် တစ်ကြောင်းချင်း တွက်ပြီး စုစုပေါင်း ပေးမယ်\n" +
+  "• Reply လုပ်ပြီး <code>/calc</code> ရိုက်ရင် အဲဒီစာကို တွက်ပေးမယ်\n\n" +
+  "<i>Admin: /set calc auto|cmd|off</i>";
+
+// Returns true when the message was answered as a calculation.
+async function calcHandle(env, m, chat, text, isGroup) {
+  const mode = S.calc || "auto";
+  let cmd = text.match(/^\/(?:calc|change)(?:@\w+)?(?:\s+([\s\S]*))?$/i);
+  if (cmd && /^\/change/i.test(text)) { const nn = (cmd[1] || "").trim().split(/\s+/); cmd = [cmd[0], nn.length === 2 && /^[\d.,]+[kKmM]?$/.test(nn[0]) ? `paid ${nn[0]} price ${nn[1]}` : cmd[1]]; }
+  if (mode === "off") return false;
+  if (!cmd && (mode !== "auto" || text.startsWith("/"))) return false;
+  let body = cmd ? (cmd[1] || "").trim() : text;
+  if (cmd && !body) body = String(m.reply_to_message?.text || m.reply_to_message?.caption || "").trim();
+  if (cmd && !body) { await send(env, chat, CALC_HELP); return true; }
+  if (!body || body.length > 600) return false;
+  if (!cmd) {
+    // Automatic mode stays quiet on anything that could be an ID, a date, a phone number or a formatted notice.
+    if (isGroup && isFormatted(m)) return false;
+    if (m.reply_to_message?.from?.is_bot) return false;
+    if (/\d{5,20}\s*[(（]\s*\d{1,6}\s*[)）]/.test(body)) return false;                 // 123456789(2002)
+    if (/^\d{6,20}[-–/|,:.]\d{1,6}$/.test(body.trim()) && !/0{3}[-–/|,:.]/.test(body.trim())) return false;   // 123456789-2002 (round amounts like 1000000-50000 are calculated)
+    if (/^\d{1,4}[-/.]\d{1,2}[-/.]\d{2,4}$/.test(body.trim())) return false;           // 12-11-2026
+    if (/^(?:\+?95|0)9[\d\s-]{7,}$/.test(body.trim())) return false;                    // 09-123-456-789
+  }
+  const lines = body.split(/\n+/).map((x) => x.trim()).filter(Boolean);
+  if (!lines.length || lines.length > 16) return false;
+  const uid = String(m.from?.id || chat);
+  const ans = CALC_ANS.get(uid);
+  if (lines.length === 1) {
+    const one = lines[0];
+    const chg = calcChangeParse(one);   // "paid 50000 price 45000" (the price may be a package list: "paid 20000 price ml 86 x3")
+    if (chg) {
+      try { await sendCard(env, chat, calcChangeHtml(await calcChangeEval(env, chg))); return true; }
+      catch (e) { if (!(e instanceof CalcErr)) throw e; if (!cmd) return false; }
+    }
+    const cur = calcCurrencyParse(one);   // "50 usd to mmk": uses the store's USD rate, so only owners / group admins
+    if (cur) {
+      const isOwn = idList(env.OWNER_IDS).includes(String(m.from?.id));
+      if (isOwn || (isGroup && (await isAdmin(env, chat, m.from?.id)))) {
+        const rate = await storeRate(env);
+        if (!rate) { await send(env, chat, esc(NO_RATE)); return true; }
+        const o = calcCurrencyOut(cur, rate);
+        await sendCard(env, chat, `💱 <b>${esc(o.text)}</b>\n<i>rate ${esc(String(rate))}</i>`, { reply_markup: { inline_keyboard: [[{ text: "Copy", copy_text: { text: String(Math.round(o.y * 100) / 100) }, style: "primary", ...ic(env, "ICON_COPY") }]] } });
+        return true;
+      }
+      if (cmd) { await send(env, chat, "⛔ Admin ပဲ သုံးလို့ရပါတယ်"); return true; }
+      return false;
+    }
+    if (cmd) { const qq = await parseQuote(env, one); if (qq) { await sendQuote(env, chat, qq); return true; } }   // /calc ml 86 x3
+  }
+  const rows = [];
+  let meaningful = false;
+  for (const line of lines) {
+    if (line.length > 200) return false;
+    const conv = lines.length === 1 ? calcConvert(line) : null;
+    if (conv) { rows.push({ src: line, conv }); meaningful = true; continue; }
+    try {
+      const r = calcEval(calcNormalize(line), ans);
+      if (r.ops > 0 && (r.nums >= 2 || /[A-Za-z]\w*\s*\(/.test(line))) meaningful = true;
+      rows.push({ src: line, v: r.v });
+    } catch (e) {
+      if (!(e instanceof CalcErr)) { if (cmd) throw e; return false; }
+      if (!cmd) return false;   // chatter, not a calculation
+      const why = e.message === "unknown" ? `မသိတဲ့ စကားလုံး: <code>${esc(e.what)}</code>` : e.message === "args" ? `<code>${esc(e.what)}()</code> ရဲ့ ဂဏန်းအရေအတွက် မမှန်ပါ` : CALC_ERR[e.message] || CALC_ERR.syntax;
+      return await send(env, chat, `🧮 ⚠️ ${why}\n<code>${esc(line)}</code>\n\nနည်းလမ်းကြည့်ရန် <code>/calc</code>`), true;
+    }
+  }
+  if (!cmd && !meaningful) return false;
+
+  let html, plain;
+  if (rows.length === 1) {
+    const r = rows[0];
+    if (r.conv) { html = `🔄 <b>${esc(r.conv.text)}</b>`; plain = r.conv.plain; }
+    else {
+      const f = calcFmt(r.v);
+      plain = f.plain;
+      CALC_ANS.set(uid, r.v);
+      if (CALC_ANS.size > 2000) CALC_ANS.clear();
+      const abs = Math.abs(r.v);
+      const lakh = abs >= 1e5 && abs < 1e12 ? `\n<i>≈ ${esc(calcFmt(Math.round((r.v / 1e5) * 100) / 100).pretty)} သိန်း</i>` : "";
+      html = `🧮 <b>Calculator</b>\n<blockquote>${esc(calcNormalize(r.src))}</blockquote>\n<b>= ${esc(f.pretty)}</b>${lakh}`;
+    }
+  } else {
+    let total = 0;
+    const out = rows.map((r, k) => {
+      total += r.v;
+      return `${k + 1}) <code>${esc(calcNormalize(r.src))}</code> = <b>${esc(calcFmt(r.v).pretty)}</b>`;
+    });
+    const f = calcFmt(total);
+    plain = f.plain;
+    CALC_ANS.set(uid, total);
+    html = `🧮 <b>Calculator</b>\n${out.join("\n")}\n━━━━━━━━\n<b>Σ Total = ${esc(f.pretty)}</b>`;
+  }
+  const copy = { text: "Copy", copy_text: { text: String(plain).slice(0, 256) }, style: "primary", ...ic(env, "ICON_COPY") };
+  await sendCard(env, chat, html, { reply_markup: { inline_keyboard: [[copy]] } });
+  return true;
+}
+
 /* ---------- Bot flow ---------- */
 const MENU_TEXT =
   "<b>🤖 PCA Name Check Bot</b>\n" +
-  "Player ID + Server ID ပို့ရင် Name စစ်ပေးပါတယ်\n<code>123456789(2002)</code>\n(ရှေ့က <b>id</b> ခံရင် ပိုတိကျပါတယ်: <code>id 123456789(2002)</code>)\n\n" +
-  "ဖတ်ချင်တာ ခလုတ်နှိပ်ပါ 👇";
+  "ID + Server ပို့ရင် Name စစ်ပေးမယ်\n<code>123456789(2002)</code>\n" +
+  "ဈေးကြည့်ရန် game အတိုကောက် ရိုက်ပါ — <code>ml</code>\n" +
+  "တွက်ချက်ရန် — <code>5000+3000*2</code> သို့ <code>/calc</code>";
 const HELP_PAGES = {
   w: ["📝 Post တင်နည်း", POST_HELP_TEXT],
   n: ["🔎 Name စစ်နည်း",
-    "<b>🔎 Name စစ်နည်း</b>\nGroup မှာ <code>123456789(2002)</code> လို့ပို့ရင် ရပါတယ်။ ရှေ့က <b>id</b> ခံရင် ပိုတိကျပါတယ်\n<code>id 123456789(2002)</code>\n\nServer မလိုတဲ့ game ဆိုရင် <b>id</b> ရှေ့ခံ ပို့ပါ\n<code>id 123456789</code> (DM မှာ id မလိုပါ)\n\n" +
-    "Game နာမည်ပါ ထည့်ရင် ပိုမြန်ပြီး တိကျပါတယ်\n<code>mlbb 123456789(2002)</code>\n<code>sm 123456789(2002)</code>\n\n" +
-    "Server ID မလိုတဲ့ game ဆိုရင် ID ပဲ ပို့ပါ\n<code>123456789</code>\n\n" +
-    "ID နဲ့ Server ကို space ( ) | - , ဘာနဲ့ခြားခြား ရပါတယ်။\n\n" +
-    "<b>🤖 Game နာမည် မထည့်ရင်</b>\n• ID + Server ပို့ရင် Server လိုတဲ့ game တွေကို အစဉ်လိုက် ရှာပြီး ပထမဆုံး တွေ့တဲ့ game ရဲ့ Card ၁ ခုပဲ ပြပါမယ်\n• ID ပဲ ပို့ရင် Server မလိုတဲ့ game တွေကိုပဲ ရှာပါမယ်\n• Game နာမည်ပေးပြီး Server မပါရင် Server ID တောင်းပါမယ် (Server list ရှိရင် တွဲပြပါမယ်)\n• Bot မေးတဲ့ စာကို reply လုပ်ပြီး ID ပို့လည်း ရပါတယ်၊ Game နာမည် ပြန်မရိုက်ရပါ\n\n<b>🔽 Server ရွေးရတဲ့ game</b> (ဥပမာ gi)\nGame နာမည် အရင်ရိုက်ပါ၊ ID ပို့ရင် Server ကို ခလုတ်နဲ့ ရွေးခိုင်းပါမယ်\n<code>gi 800123456</code> (သို့) <code>gi 800123456 asia</code>"],
+    "<b>🔎 Name စစ်နည်း</b>\n<code>123456789(2002)</code>\nGame နာမည်ပါရင် ပိုမြန်: <code>ml 123456789 2002</code>\nGroup မှာ <b>id</b> ရှေ့ခံ: <code>id 123456789(2002)</code>\nServer မလိုရင် ID ပဲ ပို့: <code>id 123456789</code>\nID နဲ့ Server ကို space ( ) | - , ဘာနဲ့ခြားခြား ရ\nBot မေးတဲ့စာကို reply လုပ်ပြီး ID ပို့လည်း ရ"],
   g: ["🎮 အတိုကောက်",
-    "<b>🎮 အတိုကောက်</b>\nmlbb · ml · pubg · pubgm · codm · cod · ff · sm · hok · hsr · zzz · valo · bs · coc · cr · mcgg\n(Game နာမည်ရဲ့ ရှေ့စာလုံးတွေလည်း ရပါတယ်၊ ဥပမာ gi)\nGame များနေရင် ခလုတ်နဲ့ ရွေးခိုင်းပါမယ်။"],
+    "<b>🎮 အတိုကောက် · ဈေး · ဝယ်</b>\n• ဈေးကြည့် — <code>ml</code>\n• Name စစ် — <code>ml 123456789 2002</code>\n• ဝယ် (Admin) — <code>ml 123456789 2002 86</code>\n  Wallet လောက်ရင် မစစ်ဘဲ တန်းဝယ်ပေးမယ်၊ <code>ml 123456789 2002 86 wp2</code> (wp2 = wp နှစ်ခု၊ <code>86x3</code> ရ)၊ စုစုပေါင်း ၁၀ ခုထိ\n  Package အတိုကောက်: <code>/pkgs ml</code>\n\nmlbb · ml · pubg · pubgm · codm · cod · ff · sm · hok · hsr · zzz · valo · bs · coc · cr · mcgg\n(Game နာမည်ရဲ့ ရှေ့စာလုံးတွေလည်း ရ၊ ဥပမာ gi)"],
+  c: ["🧮 Calculator", CALC_HELP],
   t: ["✈️ Telegram",
-    "<b>✈️ Telegram (Stars / Premium)</b>\n<code>@username</code>\n(Group မှာ username တစ်ခုတည်း ပို့မှ စစ်ပါမယ်)"],
+    "<b>✈️ Telegram (Stars / Premium)</b>\n<code>@username</code>\n(Group မှာ username တစ်ခုတည်း ပို့မှ စစ်မယ်)"],
   r: ["✅ ရလဒ်",
-    "<b>✅ ရလဒ်</b>\n• တွေ့ရင် ✅ Card — Game၊ နာမည်၊ ID (Server) နဲ့ <b>Copy ID</b>၊ <b>Store ဝင်ရန်</b> ခလုတ်\n• မတွေ့ရင် ❌ <b>Player Not found</b> — ID / Server ID ပြန်စစ်ပါ\n• ⚠️ <b>busy</b> ပြရင် Provider ပြဿနာပါ၊ ခဏနေ ပြန်စမ်းပါ\n• Voucher၊ Provider က နာမည်မပြန်တဲ့ game တွေကို စစ်လို့မရပါ"],
+    "<b>✅ ရလဒ်</b>\n• ✅ တွေ့ — Game၊ နာမည်၊ ID (Server) + <b>Copy ID</b>၊ <b>Store</b>\n• ❌ <b>Player Not found</b> — ID / Server ပြန်စစ်ပါ\n• ⚠️ <b>busy</b> — Provider ပြဿနာ၊ ခဏနေ ပြန်စမ်းပါ\n• Voucher နဲ့ နာမည်မပြန်တဲ့ game တွေ စစ်လို့မရ"],
   p: ["📌 Group မှာ",
-    "<b>📌 Group မှာ</b>\n• Card တွေ ၁ နာရီကြာရင် အလိုလို ပျက်ပါမယ်\n• ⏳ တစ်မိနစ်ကို ၃ ကြိမ်ပဲ စစ်လို့ရပါတယ် (မူလ)\n• ID မပါတဲ့ ပုံမှန်စကား ပြောရင် Bot က မပြန်ပါ\n• Bot ကို Private chat မှာ သတ်မှတ်ထားတဲ့ Owner ပဲ သုံးလို့ရ"],
+    "<b>📌 Group မှာ</b>\n• Card တွေ ၁ နာရီကြာရင် အလိုလို ပျက်မယ်\n• တစ်မိနစ် ၃ ကြိမ်ပဲ စစ်လို့ရ (မူလ)\n• ID မပါတဲ့ စကားပြောကို မပြန်ပါ\n• Private chat က Owner ပဲ သုံးလို့ရ၊ Customer က ဈေး/ID/Order ပဲ"],
   s: ["📜 စည်းကမ်း",
-    "<b>📜 Group စည်းကမ်း</b> (Admin တွေကို မထိပါ)\n❌ Forward · Link (@username တစ်ခုတည်း ပို့တာတော့ ရ) · ရိုင်းတဲ့စကား\n❌ Spam — ၁၀ စက္ကန့်အတွင်း စာ ၅ စောင်ထက်များ၊ (သို့) တူတဲ့စာ ၁ မိနစ်အတွင်း ၃ ကြိမ်\n⚠️ ၁-၂ ကြိမ် သတိပေး → ၃ ကြိမ် ၁ နာရီ mute → ၄ ကြိမ် ban\n(နောက်ဆုံး သတိပေးချက်ကနေ ၂၄ နာရီကြာရင် ပျောက်ပါမယ်)\n\n" +
-    "<b>🔒 Member အသစ်</b>\nCaptcha ဖွင့်ထားရင် ၅ မိနစ်အတွင်း ခလုတ်နှိပ်ရပါမယ်၊ မနှိပ်ရင် group ကနေ ထုတ်ပါမယ် (ပြန်ဝင်လို့ရ)။\n\n" +
-    "<b>💬 FAQ</b>\nဈေး၊ ဘယ်လိုဝယ် စတဲ့ မေးခွန်းတွေကို Admin ထည့်ထားတဲ့အတိုင်း အလိုလို ပြန်ဖြေပါမယ်။"],
+    "<b>📜 Group စည်းကမ်း</b> (Admin မထိ)\n❌ Forward · Link · ရိုင်းတဲ့စကား · Spam\n⚠️ ၁-၂ ကြိမ် သတိပေး → ၃ ကြိမ် ၁ နာရီ mute → ၄ ကြိမ် ban (၂၄ နာရီကြာရင် ပျောက်)\n🔒 Captcha ဖွင့်ထားရင် Member အသစ် ၅ မိနစ်အတွင်း ခလုတ်နှိပ်ရ\n💬 FAQ — Admin ထည့်ထားတဲ့အတိုင်း အလိုလို ဖြေမယ်"],
 };
 // Blue (primary) buttons, two per row. h:<page> opens a page, h:0 is the menu, h:a is the admin help (admins only).
-const helpMenu = (admin = false, priv = false) => {
-  const b = (k) => ({ text: HELP_PAGES[k][0], callback_data: "h:" + k, style: "primary" });
-  const rows = [[b("n"), b("g")], [b("t"), b("r")], [b("p"), b("s")]];
-  if (admin) rows.push([{ text: "🛠 Admin", callback_data: "h:a", style: "primary" }]);
-  if (priv) rows.push([b("w")], closeRow());   // owner's private chat: Post how-to + ❌ ပိတ် (deletes the menu)
-  return { inline_keyboard: rows };
+const helpRows = (admin = false, priv = false) => {
+  const b = (k) => ({ text: HELP_PAGES[k][0], data: "h:" + k, style: "primary" });
+  const rows = [[b("n"), b("g")], [b("t"), b("r")], [b("c"), b("p")], [b("s")]];
+  if (admin) { rows.push([{ text: "🛠 Admin", data: "h:a", style: "primary" }, { text: "💰 Balance", data: "bl:x", style: "primary" }]); if (priv) rows.push([b("w")]); }
+  else if (priv) rows.push([b("w")]);
+  if (priv) rows.push([CLOSE_BTN]);
+  return rows;
 };
+const helpMenu = (admin = false, priv = false) => ({ inline_keyboard: toInline(helpRows(admin, priv)) });
+const adminMenu = () => ({ inline_keyboard: toInline(adminRows()) });
 
 /* ---------- Customer DM features ----------
    Customers can open the bot in private chat (owner switch: /set dmopen off). They get a menu with:
@@ -3071,30 +3622,30 @@ const helpMenu = (admin = false, priv = false) => {
    Admin-only commands are untouched: they still need the owner (private) or a group admin. */
 const LANGS = {
   my: {
-    menuBody: "<b>🤖 PCA Name Check Bot</b>\nPlayer ID နဲ့ Server ID ပို့ရင် Name စစ်ပေးပါတယ်\n<code>123456789(2002)</code>\n\nအောက်က ခလုတ်တွေကိုလည်း သုံးလို့ရပါတယ် 👇",
-    btnId: "🆔 ကျွန်တော့် ID များ", btnPrice: "💰 ဈေးနှုန်း", btnOrders: "📦 ကျွန်တော့် Order", btnPay: "💳 ငွေလွှဲရန်", btnLang: "🌐 Language", btnStore: "Store ဝင်ရန်", btnHelp: "ℹ️ အကူအညီ",
-    noIds: "🆔 စစ်ထားတဲ့ ID မရှိသေးပါ။\nPlayer ID နဲ့ Server ID ပို့ပြီး စစ်ကြည့်ပါ။",
-    idsTitle: "🆔 <b>ကျွန်တော့် ID များ</b>\nနှိပ်ရင် ပြန်စစ်ပေးပါမယ် 👇", btnClear: "🗑 အကုန်ဖျက်", idsCleared: "🗑 ဖျက်ပြီးပါပြီ",
-    pickGame: "💰 <b>ဈေးနှုန်း</b>\nGame ရွေးပါ 👇", noPrice: "ဒီ game ရဲ့ ဈေးနှုန်း မတွေ့ပါ။", gameNotFound: (q) => `❌ <b>${q}</b> ဆိုတဲ့ game မတွေ့ပါ။`,
-    priceNote: "ဈေးနှုန်းက Store ထဲကအတိုင်းပါ၊ ပြောင်းလဲနိုင်ပါတယ်။",
-    ordersTitle: "📦 <b>ကျွန်တော့် Order</b> (Done ပြီးတာ၊ ရက် ၁၄ အတွင်း)", noOrders: "📦 Done ပြီးတဲ့ order မရှိသေးပါ (ရက် ၁၄ အတွင်း)။",
-    langPick: "🌐 ဘာသာစကား ရွေးပါ", langSet: "✅ မြန်မာဘာသာ ပြောင်းပြီးပါပြီ",
-    dmOnly: "🔒 ဒီ command ကို Bot နဲ့ private chat (DM) မှာ သုံးပါ။",
-    offDefault: "🕐 ယခု Admin မရှိတဲ့ အချိန်ဖြစ်ပါတယ်။ Name စစ်တာ၊ ဈေးနှုန်း၊ ငွေလွှဲအချက်အလက်ကို Bot က ဆက်ပြီး ဖြေပေးပါမယ်။ Admin ပြန်ရောက်ရင် ဆက်သွယ်ပါမယ်။",
-    dupReceipt: "⚠️ <b>ဒီ receipt ပုံကို အရင်က ပို့ဖူးပါတယ်</b>",
+    menuBody: "<b>🤖 PCA Name Check Bot</b>\nID + Server ပို့ရင် Name စစ်ပေးမယ်\n<code>123456789(2002)</code>\nဈေးကြည့်ရန် game အတိုကောက် ရိုက်ပါ — <code>ml</code>",
+    btnId: "🆔 ကျွန်တော့် ID", btnPrice: "💰 ဈေးနှုန်း", btnOrders: "📦 Order", btnPay: "💳 ငွေလွှဲရန်", btnLang: "🌐 Language", btnStore: "🏪 Store", btnHelp: "ℹ️ အကူအညီ",
+    noIds: "🆔 စစ်ထားတဲ့ ID မရှိသေးပါ။",
+    idsTitle: "🆔 <b>ကျွန်တော့် ID များ</b>\nနှိပ်ရင် ပြန်စစ်ပေးမယ်", btnClear: "🗑 အကုန်ဖျက်", idsCleared: "🗑 ဖျက်ပြီးပါပြီ",
+    pickGame: "💰 <b>ဈေးနှုန်း</b>\nGame ရွေးပါ (သို့) အတိုကောက်ရိုက်ပါ — <code>ml</code>", noPrice: "ဒီ game ဈေးနှုန်း မတွေ့ပါ။", gameNotFound: (q) => `❌ <b>${q}</b> game မတွေ့ပါ။`,
+    priceNote: "ဈေးက Store အတိုင်းပါ၊ ပြောင်းနိုင်ပါတယ်။",
+    ordersTitle: "📦 <b>ကျွန်တော့် Order</b> (ရက် ၁၄)", noOrders: "📦 Order မရှိသေးပါ။",
+    langPick: "🌐 ဘာသာစကား ရွေးပါ", langSet: "✅ မြန်မာဘာသာ ပြောင်းပြီး",
+    dmOnly: "🔒 ဒီ command ကို DM မှာ သုံးပါ။",
+    offDefault: "🕐 Admin မရှိချိန်ပါ။ Name စစ်၊ ဈေး၊ ငွေလွှဲအချက်အလက်ကို Bot က ဆက်ဖြေပါမယ်။",
+    dupReceipt: "⚠️ <b>ဒီ receipt ပုံ အရင်ပို့ဖူးပါတယ်</b>",
   },
   en: {
-    menuBody: "<b>🤖 PCA Name Check Bot</b>\nSend a Player ID and Server ID to check the player name\n<code>123456789(2002)</code>\n\nYou can also use the buttons below 👇",
-    btnId: "🆔 My IDs", btnPrice: "💰 Price list", btnOrders: "📦 My orders", btnPay: "💳 Payment", btnLang: "🌐 Language", btnStore: "Open Store", btnHelp: "ℹ️ Help",
-    noIds: "🆔 No checked IDs yet.\nSend a Player ID and Server ID to check one.",
-    idsTitle: "🆔 <b>My IDs</b>\nTap one to check it again 👇", btnClear: "🗑 Clear all", idsCleared: "🗑 Cleared",
-    pickGame: "💰 <b>Price list</b>\nPick a game 👇", noPrice: "No prices found for this game.", gameNotFound: (q) => `❌ Game <b>${q}</b> not found.`,
-    priceNote: "Prices are the same as in the store and may change.",
-    ordersTitle: "📦 <b>My orders</b> (completed, last 14 days)", noOrders: "📦 No completed orders yet (last 14 days).",
-    langPick: "🌐 Choose your language", langSet: "✅ Language set to English",
-    dmOnly: "🔒 Please use this command in a private chat (DM) with the bot.",
-    offDefault: "🕐 The admin is away right now. The bot still answers name checks, prices and payment details. The admin will get back to you later.",
-    dupReceipt: "⚠️ <b>This receipt image was already sent before</b>",
+    menuBody: "<b>🤖 PCA Name Check Bot</b>\nSend Player ID + Server ID to check a name\n<code>123456789(2002)</code>\nFor prices type a game short name — <code>ml</code>",
+    btnId: "🆔 My IDs", btnPrice: "💰 Prices", btnOrders: "📦 Orders", btnPay: "💳 Payment", btnLang: "🌐 Language", btnStore: "🏪 Store", btnHelp: "ℹ️ Help",
+    noIds: "🆔 No checked IDs yet.",
+    idsTitle: "🆔 <b>My IDs</b>\nTap one to check again", btnClear: "🗑 Clear all", idsCleared: "🗑 Cleared",
+    pickGame: "💰 <b>Prices</b>\nPick a game (or type a short name — <code>ml</code>)", noPrice: "No prices for this game.", gameNotFound: (q) => `❌ Game <b>${q}</b> not found.`,
+    priceNote: "Same prices as the store, may change.",
+    ordersTitle: "📦 <b>My orders</b> (14 days)", noOrders: "📦 No orders yet.",
+    langPick: "🌐 Choose language", langSet: "✅ Language set to English",
+    dmOnly: "🔒 Use this command in a DM.",
+    offDefault: "🕐 Admin is away. The bot still answers name checks, prices and payment info.",
+    dupReceipt: "⚠️ <b>This receipt was already sent</b>",
   },
 };
 const L = (lang, k, ...a) => {
@@ -3105,19 +3656,16 @@ async function getLang(env, uid) {
   if (!env.STATE || !uid) return "my";
   return (await env.STATE.get("lang:" + uid).catch(() => null)) === "en" ? "en" : "my";
 }
-async function customerMenuMarkup(env, lang) {
-  const rows = [
-    [{ text: L(lang, "btnId"), callback_data: "mi:l", style: "primary" }, { text: L(lang, "btnPrice"), callback_data: "pr:l", style: "primary" }],
-    [{ text: L(lang, "btnOrders"), callback_data: "mo:l", style: "primary" }, { text: L(lang, "btnPay"), callback_data: "pm:l", style: "primary" }],
-    [{ text: L(lang, "btnLang"), callback_data: "lg:t" }, { text: L(lang, "btnHelp"), callback_data: "h:0" }],
-  ];
+async function customerMenuRows(env, lang) {
+  const b = (k, d, style = "primary") => ({ text: L(lang, k), data: d, style });
+  const rows = [[b("btnId", "mi:l"), b("btnPrice", "pr:l")], [b("btnOrders", "mo:l"), b("btnPay", "pm:l")], [b("btnLang", "lg:t", ""), b("btnHelp", "h:0", "")]];
   const store = await getStore(env);
-  if (store) rows.push([{ text: L(lang, "btnStore"), url: store, style: "primary", ...ic(env, "ICON_STORE") }]);
-  return { inline_keyboard: rows };
+  if (store && /^https:\/\//.test(store)) rows.push([{ text: L(lang, "btnStore"), url: store, style: "primary" }]);
+  return rows;
 }
 const sendCustomerMenu = async (env, chat, uid) => {
   const lang = await getLang(env, uid);
-  return send(env, chat, L(lang, "menuBody"), { reply_markup: await customerMenuMarkup(env, lang) });
+  return sendUi(env, chat, L(lang, "menuBody"), await customerMenuRows(env, lang));
 };
 
 // ----- saved IDs (last 6 per person) -----
@@ -3133,91 +3681,183 @@ async function rememberId(env, uid, group, id, server) {
 async function showMyIds(env, chat, uid, lang) {
   const list = env.STATE ? await env.STATE.get("ids:" + uid, "json").catch(() => null) : null;
   if (!Array.isArray(list) || !list.length) return send(env, chat, L(lang, "noIds"));
-  const rows = list.map((x, n) => [{ text: `🎮 ${x.n} · ${x.i}${x.s ? `(${x.s})` : ""}`.slice(0, 60), callback_data: `mi:${n}`, style: "primary" }]);
-  rows.push([{ text: L(lang, "btnClear"), callback_data: "mi:x", style: "danger" }]);
-  return send(env, chat, L(lang, "idsTitle"), { reply_markup: { inline_keyboard: rows } });
+  const rows = list.map((x, n) => [{ text: `🎮 ${x.n} · ${x.i}${x.s ? `(${x.s})` : ""}`, data: `mi:${n}`, style: "primary" }]);
+  rows.push([{ text: L(lang, "btnClear"), data: "mi:x", style: "danger" }]);
+  return sendUi(env, chat, L(lang, "idsTitle"), rows, undefined, 28);
 }
 
 // ----- price list (straight from the store's games) -----
-let PKG = { t: 0, map: null };
+let PKG = { src: null, map: null };
+const pkgEntryOf = (o) => ({
+  server: String(o.serverName || ""),
+  code: String(o.g2bulkCode || "").trim(),
+  packages: Array.isArray(o.packages) ? o.packages : [],
+  labels: o.packageTabLabels && typeof o.packageTabLabels === "object" ? o.packageTabLabels : {},
+  customTabs: Array.isArray(o.packageTabs) ? o.packageTabs.map(String) : [],
+});
 async function loadPackages(env) {
-  if (PKG.map && Date.now() - PKG.t < 5 * 60 * 1000) return PKG.map;
+  const docs = await loadGameDocs(env);
+  if (PKG.map && PKG.src === docs) return PKG.map;
   const map = new Map();
-  let token = "";
-  for (let i = 0; i < 10; i++) {
-    const qs = new URLSearchParams({ pageSize: "300", key: env.FIREBASE_API_KEY || FS_KEY });
-    ["name", "serverName", "packages", "order"].forEach((f) => qs.append("mask.fieldPaths", f));
-    if (token) qs.set("pageToken", token);
-    let j;
-    try {
-      const r = await fetch(`https://firestore.googleapis.com/v1/projects/${FS_PROJECT}/databases/(default)/documents/games?${qs}`);
-      if (!r.ok) break;
-      j = await r.json();
-    } catch { break; }
-    (j.documents || []).forEach((d) => {
-      const o = fv({ mapValue: { fields: d.fields || {} } }) || {};
-      if (!o.name) return;
-      const key = String(o.name).trim().toLowerCase();
-      if (!map.has(key)) map.set(key, []);
-      map.get(key).push({ server: String(o.serverName || ""), packages: Array.isArray(o.packages) ? o.packages : [] });
-    });
-    token = j.nextPageToken || "";
-    if (!token) break;
+  for (const o of docs) {
+    if (!o || !o.name) continue;
+    const key = String(o.name).trim().toLowerCase();
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(pkgEntryOf(o));
   }
-  if (map.size) PKG = { t: Date.now(), map };
+  if (map.size) PKG = { src: docs, map };
   return map.size ? map : PKG.map || new Map();
+}
+// Live prices for ONE game (query by name = only that game's documents are read). Used when buying and by /pkgs.
+async function freshPackages(env, group) {
+  const names = [...new Set(group.entries.map((e) => String(e.name || "")).filter(Boolean))];
+  const out = [];
+  for (const name of names) {
+    try {
+      const r = await fetch(`https://firestore.googleapis.com/v1/projects/${FS_PROJECT}/databases/(default)/documents:runQuery?key=${encodeURIComponent(env.FIREBASE_API_KEY || FS_KEY)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ structuredQuery: {
+          from: [{ collectionId: "games" }],
+          where: { fieldFilter: { field: { fieldPath: "name" }, op: "EQUAL", value: { stringValue: name } } },
+          select: { fields: ["name", "serverName", "packages", "g2bulkCode", "packageTabLabels", "packageTabs"].map((fieldPath) => ({ fieldPath })) },
+        } }),
+      });
+      if (!r.ok) continue;
+      for (const row of await r.json()) {
+        if (!row.document) continue;
+        const o = fv({ mapValue: { fields: row.document.fields || {} } }) || {};
+        if (o.name) out.push(pkgEntryOf(o));
+      }
+    } catch {}
+  }
+  return out;
 }
 async function sendPricePicker(env, chat, lang, list) {
   const groups = list || (await loadGroups(env));
   if (!groups.length) return send(env, chat, L(lang, "noPrice"));
-  const btns = groups.slice(0, 60).map((g) => ({ text: g.name.slice(0, 28), callback_data: `pr:${g.id}`, style: "primary" }));
+  const btns = groups.slice(0, 60).map((g) => ({ text: g.name, data: `pr:${g.id}`, style: "primary" }));
   const rows = [];
   for (let i = 0; i < btns.length; i += 2) rows.push(btns.slice(i, i + 2));
-  return send(env, chat, L(lang, "pickGame"), { reply_markup: { inline_keyboard: rows } });
+  rows.push([closeBtn(env)]);
+  return sendUi(env, chat, L(lang, "pickGame"), rows, 5 * 60 * 1000, 16);
 }
+// "px:c:<uid>" closes (deletes) a list / price message: the person who opened it, or an admin / owner. "px:y:<gameId>:<tab>" = Copy.
+const closeBtn = (env) => ({ text: "Close", data: `px:c:${env.requester || env.uid || 0}`, style: "danger" });
 // Bot API 10.3 rich message (sendRichMessage + HTML): heading, compact table and a button row inside the message.
 // Returns true when Telegram accepted it. Any error -> false, and the caller sends the plain text version instead.
-async function sendRichHtml(env, chat, html) {
+async function sendRichHtml(env, chat, html, ms) {
   const r = await tg(env, "sendRichMessage", {
     chat_id: chat,
     rich_message: { html },
     ...(env.replyTo ? { reply_parameters: { message_id: env.replyTo, allow_sending_without_reply: true } } : {}),
   }).catch(() => null);
-  if (r?.ok && Number(chat) < 0) await scheduleDelete(env, chat, r.result?.message_id);
+  if (r?.ok && Number(chat) < 0) await scheduleDelete(env, chat, r.result?.message_id, ms);
   return !!r?.ok;
 }
-async function sendPriceRich(env, chat, group, entries, lang) {
-  let h = `<h3>💰 ${esc(group.name)}</h3>`;
-  for (const e of entries) {
-    if (e.server && entries.length > 1) h += `<h4>${esc(e.server)}</h4>`;
-    const rows = e.packages.filter((p) => p && p.amount && Number(p.price) > 0).slice(0, 40)
-      .map((p) => `<tr><td>${esc(String(p.amount))}</td><td align="right"><b>${Number(p.price).toLocaleString("en-US")}</b> Ks</td></tr>`).join("");
-    h += `<table bordered striped compact>${rows}</table>`;
-  }
-  h += `<p><i>${esc(L(lang, "priceNote"))}</i></p>`;
-  const store = await getStore(env);
-  const btns = [];
-  if (store && /^https:\/\//.test(store)) btns.push(`<tg-button type="url" style="primary" url="${esc(store).replace(/"/g, "&quot;")}">${esc(L(lang, "btnStore"))}</tg-button>`);
-  if (Number(chat) > 0) btns.push(`<tg-button type="callback_data" style="link" data="pr:l">⬅️ ${esc(L(lang, "btnPrice"))}</tg-button>`);
-  if (btns.length) h += `<tg-button-row align="center">${btns.join("")}</tg-button-row>`;
-  return sendRichHtml(env, chat, h);
+/* ---------- Price list: tabs (catalog) + short codes + copy ---------- */
+// Package tab id, same rule as the store: pkg.tab || pkg.type || "currency". Built-in tabs: currency, package (renamable per game), plus custom tabs.
+const pkgTab = (p) => String((p && (p.tab || p.type)) || "currency");
+const priced = (p) => !!(p && p.amount && Number(p.price) > 0);
+const pkgNum = (p) => (String(p.amount || "").toLowerCase().match(/\d+(?:\.\d+)?/) || [""])[0];
+// Short code shown in the list and accepted when buying: "86 Diamonds" -> 86, "Weekly Pass" -> wp (or the /setpkg shortcut).
+function pkgShort(gkey, p) {
+  const a = String(p.amount || "").trim().toLowerCase();
+  const ov = Object.entries((S.pkgs || {})[gkey] || {}).find(([, v]) => a.includes(v));
+  if (ov) return ov[0];
+  if (/^\d/.test(a)) return pkgNum(p) + (isDoublePkg(a) ? "+" : "");
+  const ini = a.split(/[^a-z0-9]+/).filter(Boolean).map((w) => w[0]).join("");
+  return ini || pkgNum(p);
 }
-async function sendPrice(env, chat, group, lang) {
-  const map = await loadPackages(env);
-  const entries = (map.get(group.key) || []).filter((e) => e.packages.some((p) => p && p.amount && Number(p.price) > 0));
-  if (!entries.length) return send(env, chat, L(lang, "noPrice"));
-  if (S.rich !== "off" && (await sendPriceRich(env, chat, group, entries, lang).catch(() => false))) return;   // fallback: the plain message below
-  let out = `💰 <b>${esc(group.name)}</b>\n`;
+function priceTabs(entries) {
+  const have = new Set();
+  const custom = [];
   for (const e of entries) {
-    if (e.server && entries.length > 1) out += `\n<b>${esc(e.server)}</b>\n`;
-    else out += "\n";
-    const lines = e.packages.filter((p) => p && p.amount && Number(p.price) > 0).slice(0, 40)
-      .map((p) => `• ${esc(String(p.amount))} — <b>${Number(p.price).toLocaleString("en-US")}</b> Ks`);
-    out += lines.join("\n") + "\n";
+    for (const p of e.packages) if (priced(p)) have.add(pkgTab(p));
+    for (const c of e.customTabs || []) if (!custom.includes(c)) custom.push(c);
+  }
+  const order = ["currency", "package", ...custom, ...[...have].filter((t) => !["currency", "package"].includes(t) && !custom.includes(t))];
+  return order.filter((t) => have.has(t));
+}
+function tabLabel(entries, id) {
+  for (const e of entries) {
+    const l = (e.labels || {})[id];
+    if (l && (id === "currency" || id === "package")) return String(l);
+  }
+  return id === "currency" ? "Currency" : id === "package" ? "Package" : id;
+}
+// Price list of one game. More than one tab -> buttons first (tap = that tab's list). Lists in groups vanish after 2 minutes.
+async function sendPrice(env, chat, group, lang, tabIdx, mode) {
+  const MS = 2 * 60 * 1000;
+  let all = await freshPackages(env, group).catch(() => []);   // live from Firestore: same numbers as the store page and the admin panel
+  if (!all.some((e) => e.packages.some(priced))) all = (await loadPackages(env)).get(group.key) || [];
+  const entries = all.filter((e) => e.packages.some(priced));
+  if (!entries.length) return send(env, chat, L(lang, "noPrice"));
+  const tabs = priceTabs(entries);
+  if (env.bc && tabIdx === undefined && tabs.length > 1) {   // no tab buttons in Chat automation: send every tab
+    for (let i = 0; i < tabs.length; i++) await sendPrice(env, chat, group, lang, i);
+    return;
+  }
+  if (tabIdx === undefined && tabs.length > 1) {
+    const btns = tabs.map((t, i) => ({ text: tabLabel(entries, t), data: `pr:${group.id}:${i}`, style: "primary" }));
+    const rows = [];
+    for (let i = 0; i < btns.length; i += 2) rows.push(btns.slice(i, i + 2));
+    if (Number(chat) > 0) rows.push([{ text: "⬅️ " + L(lang, "btnPrice"), data: "pr:l", style: "link" }]);
+    rows.push([closeBtn(env)]);
+    return sendUi(env, chat, `💰 <b>${esc(group.name)}</b>\n${lang === "en" ? "Pick a category" : "Catalog ရွေးပါ"}`, rows, MS, 14);
+  }
+  let tab;
+  if (tabs.length > 1) {
+    if (!(tabIdx >= 0 && tabIdx < tabs.length)) return send(env, chat, L(lang, "noPrice"));
+    tab = tabs[tabIdx];
+  }
+  const es = entries
+    .map((e) => ({ server: e.server, packages: e.packages.filter((p) => priced(p) && (tab === undefined || pkgTab(p) === tab)).slice(0, 40) }))
+    .filter((e) => e.packages.length);
+  if (!es.length) return send(env, chat, L(lang, "noPrice"));
+  const title = esc(group.name) + (tab !== undefined ? " · " + esc(tabLabel(entries, tab)) : "");
+  const money = (p) => Number(p.price).toLocaleString("en-US");
+  // Owner in private chat only (never in a group, customers must not see cost): Cost USD (= Cost Ks / admin panel rate) and Cost Ks.
+  const staff = Number(chat) > 0 && idList(env.OWNER_IDS).includes(String(chat));
+  const srate = staff ? await storeRate(env) : 0;
+  const costKs = (p) => (Number(p.cost) > 0 ? Number(p.cost).toLocaleString("en-US") : "-");
+  const costUsd = (p) => (Number(p.cost) > 0 && srate ? (Number(p.cost) / srate).toFixed(2) : "-");
+  if (mode === "copy") {   // Copy button: the list as one code block (tap the block = copy), with its own Close
+    const txt = es.map((e) => (e.server && es.length > 1 ? e.server + "\n" : "") + e.packages.map((p) => `${pkgShort(group.key, p)}  ${p.amount}  ${money(p)} Ks`).join("\n")).join("\n\n");
+    return sendCard(env, chat, `<b>${title}</b>\n<pre>${esc(txt.slice(0, 3500))}</pre>\nအပေါ်က block ကို နှိပ်ရင် Copy ရပါမယ်`, { reply_markup: { inline_keyboard: [[{ text: "Close", callback_data: `px:c:${env.uid || 0}`, style: "danger" }]] } }, MS);
+  }
+  const store = await getStore(env);
+  const storeBtn = store && /^https:\/\//.test(store) ? [{ text: L(lang, "btnStore"), url: store, style: "primary" }] : [];
+  // 1) rich message: table with tap-to-copy short code / price
+  if (S.rich !== "off" && !env.bc) {
+    let h = `<h3>💰 ${title}</h3>`;
+    for (const e of es) {
+      if (e.server && es.length > 1) h += `<h4>${esc(e.server)}</h4>`;
+      h += `<table bordered striped compact>${e.packages.map((p) => `<tr><td><code>${esc(pkgShort(group.key, p))}</code></td><td>${esc(String(p.amount))}</td><td align="right"><code>${money(p)}</code> Ks</td>${srate ? `<td align="right">${costUsd(p)} USD</td><td align="right">${costKs(p)} Ks</td>` : ""}</tr>`).join("")}</table>`;
+    }
+    if (srate) h += `<p>Price Ks | Cost USD | Cost Ks (USD rate ${srate})</p>`;
+    h += `<p><i>${esc(L(lang, "priceNote"))}</i></p>`;
+    const btns = [[{ text: "Copy", data: `px:y:${group.id}:${tabIdx === undefined ? "" : tabIdx}`, style: "primary" }, closeBtn(env)]];
+    if (storeBtn.length) btns.push(storeBtn);
+    if (Number(chat) > 0 && tabs.length > 1) btns.push([{ text: "⬅️ " + group.name.slice(0, 20), data: `pr:${group.id}`, style: "link" }]);
+    if (await sendRichHtml(env, chat, h + rrows(evenRows(btns, 14)), MS).catch(() => false)) return;
+  }
+  // 2) plain fallback: tap a code to copy, plus a native Copy button with the whole list
+  let out = `💰 <b>${title}</b>\n`;
+  const plainLines = [];
+  for (const e of es) {
+    out += e.server && es.length > 1 ? `\n<b>${esc(e.server)}</b>\n` : "\n";
+    out += e.packages.map((p) => `<code>${esc(pkgShort(group.key, p))}</code> · ${esc(String(p.amount))} — <code>${money(p)}</code> Ks${srate ? ` · ${costUsd(p)} USD · ${costKs(p)} Ks` : ""}`).join("\n") + "\n";
+    e.packages.forEach((p) => plainLines.push(`${p.amount} - ${money(p)} Ks`));
   }
   out += `\n<i>${L(lang, "priceNote")}</i>`;
-  const store = await getStore(env);
-  return send(env, chat, out.slice(0, 3900), store ? { reply_markup: { inline_keyboard: [[{ text: L(lang, "btnStore"), url: store, style: "primary", ...ic(env, "ICON_STORE") }]] } } : {});
+  let copy = "";
+  for (const l of plainLines) { if ((copy ? copy.length + 1 : 0) + l.length > 256) break; copy += (copy ? "\n" : "") + l; }
+  const rows = [];
+  if (copy) rows.push([{ text: "Copy", copy_text: { text: copy }, style: "primary", ...ic(env, "ICON_COPY") }]);
+  if (storeBtn.length) rows.push([{ ...storeBtn[0], ...ic(env, "ICON_STORE") }]);
+  rows.push([{ text: "Close", callback_data: `px:c:${env.requester || env.uid || 0}`, style: "danger" }]);
+  return sendCard(env, chat, out.slice(0, 3900), rows.length ? { reply_markup: { inline_keyboard: rows } } : {}, MS);
 }
 
 // ----- my orders (Done orders in the group log whose asker is this person) -----
@@ -3232,7 +3872,7 @@ async function showMyOrders(env, chat, uid, lang) {
 
 // ----- language -----
 const sendLangPicker = (env, chat, lang) =>
-  send(env, chat, L(lang, "langPick"), { reply_markup: { inline_keyboard: [[{ text: "🇲🇲 မြန်မာ", callback_data: "lg:my", style: "primary" }, { text: "🇬🇧 English", callback_data: "lg:en", style: "primary" }]] } });
+  sendUi(env, chat, L(lang, "langPick"), [[{ text: "🇲🇲 မြန်မာ", data: "lg:my", style: "primary" }, { text: "🇬🇧 English", data: "lg:en", style: "primary" }]]);
 
 // /price /myids /myorders /language /menu (customers and members)
 async function userCommand(env, m, chat, cmd, arg, isPrivate) {
@@ -3253,11 +3893,27 @@ async function userCommand(env, m, chat, cmd, arg, isPrivate) {
   return sendCustomerMenu(env, chat, uid);
 }
 // Menu buttons in private chat: mi (my IDs) · pr (price) · mo (my orders) · pm (payment) · lg (language)
-async function customerCallback(env, q, chat, tag, arg) {
+async function customerCallback(env, q, chat, tag, arg, extra) {
   const uid = q.from.id;
+  if (tag === "px") {   // list / price screens: Close and Copy (work in groups and private chat)
+    const parts = String(q.data || "").split(":");
+    if (parts[1] === "c") {
+      const okc = !parts[2] || parts[2] === "0" || String(uid) === parts[2] || q.message.chat.type === "private" || idList(env.OWNER_IDS).includes(String(uid)) || (await isAdmin(env, chat, uid));
+      if (!okc) return tg(env, "answerCallbackQuery", { callback_query_id: q.id, text: "ဖွင့်တဲ့သူ / Admin ပဲ ပိတ်လို့ရပါတယ်", show_alert: true });
+      await tg(env, "answerCallbackQuery", { callback_query_id: q.id });
+      return tg(env, "deleteMessage", { chat_id: chat, message_id: q.message.message_id }).catch(() => {});
+    }
+    if (parts[1] === "y") {
+      await tg(env, "answerCallbackQuery", { callback_query_id: q.id });
+      const group = (await loadGroups(env)).find((g) => g.id === parts[2]);
+      if (!group) return;
+      return sendPrice({ ...env, replyTo: 0 }, chat, group, await getLang(env, uid), parts[3] === undefined || parts[3] === "" ? undefined : Number(parts[3]), "copy");
+    }
+    return tg(env, "answerCallbackQuery", { callback_query_id: q.id });
+  }
   const lang = await getLang(env, uid);
   await tg(env, "answerCallbackQuery", { callback_query_id: q.id });
-  if (q.message.chat.type !== "private") return;
+  if (q.message.chat.type !== "private" && tag !== "pr") return;
   if (tag === "mi") {
     if (arg === "l") return showMyIds(env, chat, uid, lang);
     if (arg === "x") {
@@ -3274,7 +3930,7 @@ async function customerCallback(env, q, chat, tag, arg) {
   if (tag === "pr") {
     if (arg === "l") return sendPricePicker(env, chat, lang);
     const group = (await loadGroups(env)).find((g) => g.id === arg);
-    return group ? sendPrice(env, chat, group, lang) : send(env, chat, L(lang, "noPrice"));
+    return group ? sendPrice(env, chat, group, lang, extra === undefined || extra === "" ? undefined : Number(extra)) : send(env, chat, L(lang, "noPrice"));
   }
   if (tag === "mo") return showMyOrders(env, chat, uid, lang);
   if (tag === "pm") {
@@ -3284,7 +3940,7 @@ async function customerCallback(env, q, chat, tag, arg) {
   if (tag === "lg") {
     if (arg === "my" || arg === "en") {
       if (env.STATE) await env.STATE.put("lang:" + uid, arg, { expirationTtl: 365 * 86400 }).catch(() => {});
-      return send(env, chat, L(arg, "langSet"), { reply_markup: await customerMenuMarkup(env, arg) });
+      return sendUi(env, chat, L(arg, "langSet"), await customerMenuRows(env, arg));
     }
     return sendLangPicker(env, chat, lang);
   }
@@ -3376,7 +4032,425 @@ async function receiptSeen(env, chat, uid) {
   await env.STATE.put(`rcpt:${chat}:${uid}`, "1", { expirationTtl: 900 }).catch(() => {});
 }
 
+/* ---------- Short game names, price list by name, admin auto-buy (G2Bulk wallet) ---------- */
+// Exact short names only: manual / built-in aliases, G2Bulk game code, full name, and the game's initials (3+ letters in groups).
+function abbrGroups(groups, query, loose) {
+  const q = String(query || "").trim().toLowerCase();
+  if (q.length < 1 || q.length > 30) return [];
+  const al = (S.aliases || {})[q] || ALIASES[q];
+  if (q.length < 2 && !al) return [];
+  const code = (g) => g.entries.map((e) => String(e.g2bulkCode || "").toLowerCase()).filter(Boolean);
+  let hit = groups.filter((g) => g.key === q || code(g).includes(q) || (al && g.key.includes(al)));
+  if (!hit.length && (loose || q.length >= 3)) hit = groups.filter((g) => initials(g.name).includes(q));
+  return hit;
+}
+// "ml 123456789 2002 86 wp2 x3" -> { group, id, server, want: [{ tok, qty }], entries }  (or { askServer } / null = not a buy message)
+// Letters / symbols between the ID and the Server ID are ignored. "wp2" = 2 x wp, "86x3" or "86 x3" = 3 x 86.
+const BUY_MAX_UNITS = 30;      // total packages in one message
+const BUY_MAX_ACCOUNTS = 15;   // accounts (lines) in one message
+const BUY_FILLER = /^(diamonds?|dia|stars?|pcs?|pieces?)$/i;
+// Tokens keep a trailing "+" (double diamond): "500+", "50 +" and "50+50" all become "500+" / "50+".
+function buyTokens(text) {
+  const raw = String(text).split(/[^\p{L}\p{N}\p{M}+]+/u).filter(Boolean);
+  const out = [];
+  for (const t of raw) {
+    if (/^\++$/.test(t)) { if (out.length && !out[out.length - 1].endsWith("+")) out[out.length - 1] += "+"; continue; }
+    out.push(t.replace(/^\++/, "").replace(/^(\d+)\+\d+$/, "$1+").replace(/\++$/, "+"));
+  }
+  return out.filter(Boolean);
+}
+// Message = one or more lines. Line 1: "<game> <ID> <Server> <packages>" (a leading "." is fine: ".m 123456789 2002 86 50+").
+// Next lines: "<ID> <Server> <packages>" (a game name in front is allowed, but it must be the same game).
+// -> { group, entries, orders: [{ id, server, want } | { line, err }] }   (null = not a buy message)
+async function parseBuy(env, text) {
+  const lines = String(text).split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (!lines.length || lines.length > 60) return null;
+  const groups = await loadGroups(env);
+  const pickGame = (q) => { const h = abbrGroups(groups, q, true); return h.length === 1 && !h[0].dropdown ? h[0] : null; };
+  let group = null, entries = [];
+  const setGroup = async (g) => {
+    const e = ((await loadPackages(env)).get(g.key) || []).filter((x) => x.code);
+    if (!e.length) return false;
+    group = g; entries = e; return true;
+  };
+  const isPkgTok = (t) => pickPackage(entries, t.toLowerCase(), group.key) || /^x\d{1,2}$/i.test(t) || /^[a-z]+\d{1,2}$/i.test(t) || /^\d+\+?x\d{1,2}$/i.test(t);
+  const orders = [];
+  for (const line of lines) {
+    const tokens = buyTokens(line);
+    const i = tokens.findIndex((t) => /^\d{5,20}$/.test(t));
+    const bad = (why, id) => { orders.push({ id, line, err: why }); };
+    if (i === -1) {
+      if (!group && !orders.length && tokens.length <= 2) {   // the game name alone on the first line
+        const g = pickGame(tokens.join(" "));
+        if (g && (await setGroup(g))) continue;
+      }
+      if (!group) return null;
+      bad("Format မမှန်ပါ");
+      continue;
+    }
+    if (i > 2) { if (!group) return null; bad("Format မမှန်ပါ"); continue; }
+    if (i >= 1) {
+      const g = pickGame(tokens.slice(0, i).join(" "));
+      if (!group) { if (!g || !(await setGroup(g))) return null; }
+      else if (g && g.key !== group.key) { bad("Game မတူပါ", tokens[i]); continue; }
+    } else if (!group) return null;
+    const first = !orders.length;
+    const id = tokens[i];
+    const rest = tokens.slice(i + 1).filter((t) => !BUY_FILLER.test(t));
+    if (!rest.length) { if (first) return null; bad("Package မပါပါ", id); continue; }
+    let server = "", wantRaw = rest;
+    if (!group.idOnly) {
+      const si = rest.findIndex((t) => /^\d{1,6}$/.test(t));   // first number after the ID = Server ID
+      if (si === -1) {
+        if (first && !rest.every(isPkgTok)) return null;
+        bad("Server ID မပါပါ", id);
+        continue;
+      }
+      server = rest[si];
+      wantRaw = rest.slice(si + 1);
+    }
+    const want = [];
+    for (const raw of wantRaw) {
+      const r = raw.toLowerCase();
+      let mm;
+      if ((mm = r.match(/^x(\d{1,2})$/)) && want.length) { want[want.length - 1].qty = Number(mm[1]); continue; }
+      if (pickPackage(entries, r, group.key)) { want.push({ tok: r, qty: 1 }); continue; }
+      mm = r.match(/^(\d+\+?)x(\d{1,2})$/) || r.match(/^([a-z]+)(\d{1,2})$/);
+      if (mm && pickPackage(entries, mm[1], group.key)) { want.push({ tok: mm[1], qty: Number(mm[2]) }); continue; }
+      want.push({ tok: r, qty: 1 });
+    }
+    if (!want.length) { if (first) return null; bad("Package မပါပါ", id); continue; }
+    const merged = [];   // "86/86" = the same package twice -> one row "86 x2"
+    for (const w of want) { const p = merged.find((y) => y.tok === w.tok); if (p) p.qty += w.qty; else merged.push({ ...w }); }
+    orders.push({ id, server, want: merged });
+  }
+  if (!group || !orders.length) return null;
+  return { group, entries, orders };
+}
+// "86" -> the package whose first number is 86; "wp" -> Weekly Pass (initials / start of the name); /setpkg shortcuts win.
+// Only G2Bulk-linked, priced packages.
+// Double diamond packages are named like "50+50 Diamonds" or "Double Diamonds 50".
+const isDoublePkg = (a) => /double|\d\s*\+\s*\d/i.test(String(a));
+function pickPackage(entries, tok, gkey, any = false) {
+  const t = String(tok).toLowerCase();
+  const plus = /^\d+\+$/.test(t);          // "50+" = double diamond package; plain "50" never picks one
+  const tn = plus ? t.slice(0, -1) : t;
+  const ov = ((S.pkgs || {})[gkey] || {})[t];
+  const found = [];
+  for (const e of entries) {
+    for (const p of e.packages) {
+      if (!p || (!any && !p.g2bulk) || !(Number(p.price) > 0)) continue;
+      const a = String(p.amount || "").toLowerCase();
+      const num = (a.match(/\d+(?:\.\d+)?/) || [""])[0];
+      const ini = a.split(/[^a-z0-9]+/).filter(Boolean).map((w) => w[0]).join("");
+      let ok, exact;
+      if (ov) { ok = a.includes(ov); exact = a === ov ? 0 : 1; }
+      else {
+        ok = /^\d/.test(tn) ? num === tn && isDoublePkg(a) === plus : ini === t || a.replace(/[^a-z0-9]/g, "").startsWith(t);
+        exact = a.replace(/\D/g, "") === tn ? 0 : 1;
+      }
+      if (ok) found.push({ e, p, exact });
+    }
+  }
+  found.sort((x, y) => x.exact - y.exact);
+  return found[0] || null;
+}
+// Price / Cost / USD rate watcher (cron). Reads the games fresh (this also refreshes the bot's own cache, so prices in the bot are never stale),
+// compares with the last snapshot in KV and tells the owners what changed, as a table. First run only stores the snapshot.
+async function priceWatch(env) {
+  if (!env.STATE || S.pricewatch === "off" || S.maint === "on") return;
+  GDOCS = { t: 0, docs: GDOCS.docs };
+  await env.STATE.delete("fs:games").catch(() => {});
+  PKG = { src: null, map: null };
+  const docs = await loadGameDocs(env);
+  if (!docs.length) return;
+  RATE = { t: 0, v: 0, src: "" };
+  const rate = await storeRate(env);
+  const snap = {};
+  for (const o of docs) {
+    if (!o || !o.name || !Array.isArray(o.packages)) continue;
+    const gname = String(o.name) + (o.serverName ? ` (${o.serverName})` : "");
+    for (const p of o.packages) {
+      if (!p || !p.amount || !(Number(p.price) > 0)) continue;
+      snap[`${gname}|${p.amount}`] = [Number(p.price), Number(p.cost) || 0];
+    }
+  }
+  const prev = await env.STATE.get("pw:snap", "json").catch(() => null);
+  await env.STATE.put("pw:snap", JSON.stringify({ rate, snap }));
+  if (!prev || !prev.snap) return;
+  const rows = [];
+  for (const [k, [pr, co]] of Object.entries(snap)) {
+    const old = prev.snap[k];
+    const [g, a] = k.split("|");
+    if (!old) rows.push([g, a, "New", `${pr.toLocaleString("en-US")}`, `${co.toLocaleString("en-US")}`]);
+    else if (old[0] !== pr || old[1] !== co) rows.push([g, a, old[0] !== pr ? `${old[0].toLocaleString("en-US")} > ${pr.toLocaleString("en-US")}` : String(pr), old[1] !== co ? `${old[1].toLocaleString("en-US")} > ${co.toLocaleString("en-US")}` : String(co), ""]);
+  }
+  const lines = [];
+  if (prev.rate && rate && Number(prev.rate) !== Number(rate)) lines.push(`<b>USD rate:</b> ${prev.rate} > ${rate}`);
+  if (!rows.length && !lines.length) return;
+  if (rows.length > 60) {   // a rate change rescales every cost: one summary line instead of hundreds of rows
+    lines.push(`<b>${rows.length}</b> package ရဲ့ Price / Cost ပြောင်းသွားပါတယ်`);
+  } else if (rows.length) {
+    const head = ["Game", "Package", "Price", "Cost"];
+    const body = rows.slice(0, 30).map((r) => [r[0], r[1], r[4] ? `New ${r[3]}` : r[2], r[4] ? r[4] : r[3]]);
+    const all = [head, ...body];
+    const w = head.map((_, c) => Math.max(...all.map((r) => vlen(String(r[c])))));
+    const fit = (v, n) => String(v) + " ".repeat(Math.max(0, n - vlen(String(v))));
+    const fmt = (r) => r.map((v, c) => (c === head.length - 1 ? String(v) : fit(v, w[c]))).join("  ");
+    lines.push(`<pre>${esc([fmt(head), "-".repeat(w.reduce((x, y) => x + y, 0) + 6), ...body.map(fmt)].join("\n"))}</pre>`);
+    if (rows.length > 30) lines.push(`နောက်ထပ် ${rows.length - 30} ခု`);
+  }
+  await notifyOwners(env, `<b>Price update</b>\n` + lines.join("\n"));
+}
+
+// Live G2Bulk wallet in USD (null = could not read it; the order call itself is then the check).
+async function g2Balance(env) {
+  try {
+    const r = await fetch("https://api.g2bulk.com/v1/getMe", { headers: { "X-API-Key": env.G2BULK_API_KEY }, signal: AbortSignal.timeout(8000) });
+    const j = await r.json().catch(() => null);
+    const b = Number(j?.balance ?? j?.data?.balance);
+    if (r.ok && Number.isFinite(b)) return b;
+  } catch {}
+  try {
+    const r = await fetch("https://api.g2bulk.com/api/v2", { signal: AbortSignal.timeout(8000), method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: env.G2BULK_API_KEY, action: "balance" }) });
+    const j = await r.json().catch(() => null);
+    const b = Number(j?.balance);
+    if (Number.isFinite(b)) return b;
+  } catch {}
+  return null;
+}
+// USD -> MMK rate: ONLY the one set in the admin panel (Firestore settings/publicRates, a copy the admin panel writes on every Save of the
+// G2Bulk USD rate; settings/g2bulk is tried too). The bot never sets or guesses a rate: 0 = could not read it.
+let RATE = { t: 0, v: 0, src: "" };
+async function storeRate(env) {
+  if (RATE.v && Date.now() - RATE.t < 30 * 1000) return RATE.v;
+  for (const docName of ["publicRates", "g2bulk"]) {
+    try {
+      const qs = new URLSearchParams({ key: env.FIREBASE_API_KEY || FS_KEY });
+      qs.append("mask.fieldPaths", "usdRate");
+      const r = await fetch(`https://firestore.googleapis.com/v1/projects/${FS_PROJECT}/databases/(default)/documents/settings/${docName}?${qs}`);
+      if (!r.ok) continue;
+      const v = Number(fv({ mapValue: { fields: (await r.json()).fields || {} } })?.usdRate);
+      if (v > 0) { RATE = { t: Date.now(), v, src: "store" }; return v; }
+    } catch {}
+  }
+  RATE = { t: 0, v: 0, src: "" };
+  return 0;
+}
+const NO_RATE = "Admin panel ရဲ့ USD rate ကို မဖတ်နိုင်ပါ (Firestore rules မှာ settings/publicRates ဖတ်ခွင့် + admin မှာ rate Save လုပ်ထားမှ ရပါမယ်)";
+// Same table helper as the buy result (bordered rich table, plain monospace fallback), no emoji.
+async function showTable(env, chat, t, ms) {
+  if (S.rich !== "off" && !env.bc && (await sendRichHtml(env, chat, t.rich, ms).catch(() => false))) return;
+  return sendCard(env, chat, t.plain, {}, ms);
+}
+// G2Bulk wallet (Admin / Owner): button "Balance" in the /start menu + owner keyboard, or /balance. USD is what G2Bulk holds; Ks uses the admin panel rate.
+async function showBalance(env, chat) {
+  if (!env.G2BULK_API_KEY) return sendCard(env, chat, "G2BULK_API_KEY မထည့်ရသေးပါ", {}, 60 * 1000);
+  const bal = await g2Balance(env);
+  if (bal === null) return sendCard(env, chat, "Balance မဖတ်နိုင်ပါ၊ ခဏနေ ပြန်စမ်းပါ", {}, 60 * 1000);
+  const rate = await storeRate(env);
+  const rows = [["Wallet (USD)", bal.toFixed(2)]];
+  if (rate) rows.push(["USD rate (Admin panel)", String(rate)], ["Wallet (Ks)", Math.round(bal * rate).toLocaleString("en-US")]);
+  return showTable(env, chat, buyTable("G2Bulk Wallet", ["", "Amount"], rows, [1], rate ? "" : esc(NO_RATE)), 2 * 60 * 1000);
+}
+// /health (owner): one screen with everything that can break.
+async function showHealth(env, chat) {
+  const t0 = Date.now();
+  const [groups, pay, rate, bal, wh] = await Promise.all([
+    loadGroups(env).catch(() => []),
+    getPayMethods(env).catch(() => []),
+    storeRate(env).catch(() => 0),
+    env.G2BULK_API_KEY ? g2Balance(env).catch(() => null) : Promise.resolve(undefined),
+    tg(env, "getWebhookInfo", {}).catch(() => null),
+  ]);
+  const ok = (b) => (b ? "✅" : "❌");
+  const age = GDOCS.t ? Math.round((Date.now() - GDOCS.t) / 1000) + " စက္ကန့်အရင်" : "—";
+  const w = wh?.result || {};
+  const down = ["G2Bulk", "FazerCards"].filter((p) => PH.get(p)?.down);
+  const lines = [
+    "🩺 <b>System အခြေအနေ</b>",
+    "",
+    `${ok(groups.length)} Game list: ${groups.length} (Firestore ဖတ်ထားတာ ${age})`,
+    `${ok(pay.length)} Payment method: ${pay.length}`,
+    `${ok(rate)} USD rate: ${rate ? rate + " (Admin panel)" : "မဖတ်နိုင် — settings/publicRates စစ်ပါ"}`,
+    `${ok(!down.length)} Provider: ${down.length ? "🚨 ကျနေ — " + down.join(", ") : "G2Bulk · FazerCards ကောင်း"}`,
+    bal === undefined ? "➖ Wallet: G2BULK_API_KEY မထည့်ရသေး" : `${ok(bal !== null)} Wallet: ${bal === null ? "မဖတ်နိုင်" : bal.toFixed(2) + " USD (" + (rate ? "~" + Math.round(bal * rate).toLocaleString("en-US") + " Ks" : "rate မရ") + ")"}`,
+    `${ok(env.STATE)} Storage: ${env.DB ? "D1" : env.STATE ? "KV" : "မရှိ (auto-delete / မှတ်တမ်း မရ)"}`,
+    `${ok(!w.last_error_message)} Webhook: pending ${w.pending_update_count ?? "?"}${w.last_error_message ? " · " + esc(String(w.last_error_message).slice(0, 80)) : ""}`,
+    `${S.maint === "on" ? "🛠 Maintenance ဖွင့်ထား" : "🟢 Maintenance ပိတ်ထား"}`,
+    `⏱ ${Date.now() - t0} ms`,
+  ];
+  return sendCard(env, chat, lines.join("\n"), {}, 5 * 60 * 1000);
+}
+// Clear table, no emoji: rich message (bordered table) first, plain monospace table as the fallback.
+function buyTable(title, head, rows, right, foot) {
+  const al = (c) => (right.includes(c) ? ' align="right"' : "");
+  const rich =
+    `<h3>${esc(title)}</h3><table bordered striped compact><tr>${head.map((h, c) => `<td${al(c)}><b>${esc(h)}</b></td>`).join("")}</tr>` +
+    rows.map((r) => `<tr>${r.map((v, c) => `<td${al(c)}>${c === 0 ? `<code>${esc(v)}</code>` : esc(v)}</td>`).join("")}</tr>`).join("") +
+    `</table>` + (foot ? `<p>${foot}</p>` : "");
+  const all = [head, ...rows].map((r) => r.map(String));
+  const w = head.map((_, c) => Math.max(...all.map((r) => vlen(r[c]))));
+  const pad = (v, n, left) => (left ? " ".repeat(Math.max(0, n - vlen(v))) + v : v + " ".repeat(Math.max(0, n - vlen(v))));
+  const fmt = (r) => r.map((v, c) => (c === head.length - 1 ? v : pad(v, w[c], right.includes(c)))).join("  ");
+  const bar = "-".repeat(w.reduce((x, y) => x + y, 0) + 2 * (head.length - 1));
+  const plain = `<b>${esc(title)}</b>\n<pre>${esc([fmt(all[0]), bar, ...all.slice(1).map(fmt)].join("\n"))}</pre>` + (foot ? `\n${foot}` : "");
+  return { rich, plain };
+}
+async function doBuy(env, m, chat, plan) {
+  const { group, orders } = plan;
+  const say = (html) => sendCard(env, chat, html);
+  const show = async (t) => {
+    if (S.rich !== "off" && (await sendRichHtml(env, chat, t.rich).catch(() => false))) return;
+    await say(t.plain);
+  };
+  const idTxt = (o) => `${o.id}${o.server ? `(${o.server})` : ""}`;
+  if (orders.length > BUY_MAX_ACCOUNTS) { await say(`တစ်ကြိမ်ကို account ${BUY_MAX_ACCOUNTS} ခုအထိပဲ ဝယ်လို့ရပါတယ် (ပို့တာ ${orders.length} ခု)`); return; }
+  // prices / packages come live from the store (cache is only a few seconds)
+  const live = (await freshPackages(env, group)).filter((e) => e.code);
+  const entries = live.length ? live : plan.entries;
+  // 1) check every line first. One bad line = nothing is bought.
+  const problems = [];
+  for (const o of orders) {
+    if (o.err) { problems.push([o.id ? idTxt(o) : o.line.slice(0, 40), o.err]); continue; }
+    const items = [], bad = [];
+    for (const w of o.want) {
+      const hit = w.qty >= 1 ? pickPackage(entries, w.tok, group.key) : null;
+      if (hit) items.push({ ...w, ...hit }); else bad.push(w.tok);
+    }
+    if (bad.length) problems.push([idTxt(o), `Package မတွေ့: ${bad.join(" ")}`]);
+    else o.items = items;
+  }
+  if (problems.length) {
+    await show(buyTable(group.name, ["ID (Server)", "ပြဿနာ"], problems, [], `<b>ဘာမှ မဝယ်ရသေးပါ</b> — ပြင်ပြီး ပြန်ပို့ပါ<br><code>/pkgs ${esc(group.key)}</code> နဲ့ package အတိုကောက် ကြည့်နိုင်ပါတယ် (double diamond = <code>50+</code> <code>150+</code>)`.replace("<br>", "\n")));
+    return;
+  }
+  const units = orders.reduce((s, o) => s + o.items.reduce((t, x) => t + x.qty, 0), 0);
+  if (units > BUY_MAX_UNITS) { await say(`တစ်ကြိမ်ကို စုစုပေါင်း ${BUY_MAX_UNITS} ခုအထိပဲ ဝယ်လို့ရပါတယ် (ပို့တာ ${units} ခု)`); return; }
+  if (env.STATE) {   // Telegram may deliver the same message twice: buy once
+    const k = `buy:${chat}:${m.message_id}`;
+    if (await env.STATE.get(k).catch(() => null)) return;
+    await env.STATE.put(k, "1", { expirationTtl: 86400 }).catch(() => {});
+  }
+  // 2) same ID + Server + package within 2 minutes (or twice in this message) is skipped, the other accounts still go through
+  const seen = new Set();
+  for (const o of orders) {
+    const sig = `bd:${group.key}:${o.id}:${o.server}:${o.items.map((x) => x.tok + "x" + x.qty).join(",")}`;
+    o.sig = sig;
+    o.dup = seen.has(sig) || !!(env.STATE && (await env.STATE.get(sig).catch(() => null)));
+    seen.add(sig);
+  }
+  const todo = orders.filter((o) => !o.dup);
+  // 3) wallet must cover everything that will be bought
+  RATE = { t: 0, v: 0, src: "" };   // a buy always reads the admin rate fresh
+  const rate = await storeRate(env);
+  if (!rate) { await say(`<b>ဘာမှ မဝယ်ရသေးပါ</b>\n${esc(NO_RATE)}`); return; }
+  const mmk = (x) => (Number(x.p.cost) > 0 ? Number(x.p.cost) : Number(x.p.price));
+  const need = todo.reduce((s, o) => s + o.items.reduce((t, x) => t + mmk(x) * x.qty, 0), 0);
+  if (todo.length) {
+    const bal = await g2Balance(env);
+    if (bal !== null && bal * rate < need) {
+      const lack = need - bal * rate;
+      await show(buyTable("Wallet မလောက်ပါ", ["", "Ks", "USD"], [
+        ["လိုငွေ", Math.round(need).toLocaleString("en-US"), (need / rate).toFixed(2)],
+        ["ရှိငွေ", Math.round(bal * rate).toLocaleString("en-US"), bal.toFixed(2)],
+        ["လိုနေတာ", Math.round(lack).toLocaleString("en-US"), (lack / rate).toFixed(2)],
+      ], [1, 2], `<b>ဘာမှ မဝယ်ရသေးပါ</b> — Balance အရင်ဖြည့်ပါ (rate ${rate})`));
+      return;
+    }
+    if (env.STATE) for (const o of todo) await env.STATE.put(o.sig, "1", { expirationTtl: 120 }).catch(() => {});
+  }
+  // 4) buy: accounts run at the same time (4 at once), the packages of one account run one after another
+  let total = 0, halt = false;
+  const buyOne = async (o) => {
+    let stop = false;
+    for (const x of o.items) {
+      const row = { x, ok: 0, pend: 0, skip: 0, err: "" };
+      o.rows.push(row);
+      for (let k = 0; k < x.qty; k++) {
+        if (stop || halt) { row.skip = x.qty - k; break; }
+        let status = "", err = "";
+        try {
+          const r = await fetch(`https://api.g2bulk.com/v1/games/${encodeURIComponent(x.e.code)}/order`, {
+            method: "POST",
+            headers: { "X-API-Key": env.G2BULK_API_KEY, "X-Idempotency-Key": crypto.randomUUID(), "content-type": "application/json" },
+            signal: AbortSignal.timeout(20000),
+            body: JSON.stringify({ catalogue_name: x.p.g2bulk, player_id: o.id, server_id: o.server || undefined, remark: `NameCheck ${chat}:${m.message_id}` }),
+          });
+          const j = await r.json().catch(() => ({}));
+          if (!r.ok || j.success === false) err = String(j.message || j.error || (j.detail && (j.detail.message || j.detail)) || `HTTP ${r.status}`).slice(0, 60);
+          else status = String(j.status || j.order?.status || "PENDING").toUpperCase();
+        } catch (e) { err = e && e.name === "TimeoutError" ? "timeout — G2Bulk မှာ order စာရင်း စစ်ပါ" : "network"; }
+        if (!err && /FAIL|CANCEL/.test(status)) err = status.toLowerCase();
+        if (err) {
+          stop = true; row.err = err; row.skip = x.qty - k - 1;
+          if (/balance|insufficient|wallet|api.?key|unauthor/i.test(err)) halt = true;   // the same error would hit every account
+          break;
+        }
+        total += Number(x.p.price);
+        if (/COMPLETED|SUCCESS/.test(status)) row.ok++; else row.pend++;
+      }
+    }
+  };
+  orders.forEach((o) => { o.rows = []; });
+  const queue = todo.slice();
+  await Promise.all(Array.from({ length: Math.min(4, queue.length) }, async () => { for (let o; (o = queue.shift()); ) await buyOne(o); }));
+  orders.filter((o) => o.dup).forEach((o) => o.items.forEach((x) => o.rows.push({ x, ok: 0, pend: 0, skip: x.qty, err: "", note: "Skipped (၂ မိနစ်အတွင်း ပို့ပြီး)" })));
+  const placed = orders.reduce((s, o) => s + o.rows.reduce((t, d) => t + d.ok + d.pend, 0), 0);
+  if (placed && env.STATE) {
+    let sp = 0, sc = 0, costOk = true;
+    orders.forEach((o) => o.rows.forEach((d) => { const n = d.ok + d.pend; if (!n) return; sp += Number(d.x.p.price) * n; if (Number(d.x.p.cost) > 0) sc += Number(d.x.p.cost) * n; else costOk = false; }));
+    const now = Date.now();
+    await env.STATE.put(`sale:${dayStr()}:${String(now).padStart(14, "0")}:${chat}:${m.message_id}`, "1", {
+      expirationTtl: ORDER_TTL_S,
+      metadata: { a: ([m.from?.first_name, m.from?.last_name].filter(Boolean).join(" ") || String(m.from?.id)).slice(0, 30), t: now, g: group.name.slice(0, 40), p: Math.round(sp), c: costOk ? Math.round(sc) : 0 },
+    }).catch(() => {});
+  }
+  const label = (d) => `${String(d.x.p.amount)}${d.x.qty > 1 ? ` x${d.x.qty}` : ""}`;
+  const sub = (d) => Number(d.x.p.price) * (d.ok + d.pend);
+  const state = (d) => d.note || [
+    d.ok ? `Done${d.ok > 1 ? " x" + d.ok : ""}` : "",
+    d.pend ? `Processing${d.pend > 1 ? " x" + d.pend : ""}` : "",
+    d.err ? `Failed: ${d.err}` : "",
+    d.skip ? `Not sent${d.skip > 1 ? " x" + d.skip : ""}` : "",
+  ].filter(Boolean).join(", ");
+  if (placed) {
+    if (!idList(env.OWNER_IDS).includes(String(env.uid)))   // an admin bought: the owners get a short report
+      await notifyOwners(env, `<b>Admin order</b> ${esc(group.name)}\n` + orders.map((o) => `<code>${esc(idTxt(o))}</code> ${o.rows.map((d) => `${esc(String(d.x.p.amount))}${d.x.qty > 1 ? ` x${d.x.qty}` : ""}`).join(", ")}`).join("\n") + `\nTotal: ${total.toLocaleString("en-US")} Ks\nAdmin: ${esc([m.from?.first_name, m.from?.last_name].filter(Boolean).join(" ") || String(m.from?.id))}`).catch(() => {});
+    const lb = Number(S.lowbal);
+    if (lb > 0) {
+      const b2 = await g2Balance(env);
+      if (b2 !== null && b2 < lb) await notifyOwners(env, `<b>Wallet နည်းနေပါပြီ</b>\n${b2.toFixed(2)} USD ကျန် (သတိပေးမယ့်ကန့်သတ် ${lb} USD)`).catch(() => {});
+    }
+  }
+  const rows = orders.flatMap((o) => o.rows.map((d) => [idTxt(o), label(d), sub(d) ? sub(d).toLocaleString("en-US") : "-", state(d)]));
+  await show(buyTable(group.name, ["ID (Server)", "Package", "Ks", "Status"], rows, [2], `<b>Total: ${total.toLocaleString("en-US")} Ks</b> | ${orders.length} account`));
+}
+
+// Telegram Business: the owner connects the bot in Settings > Business > Chatbots. Customers who write to the owner's own account are
+// answered by this bot (payment info, FAQ, prices, name check). Admin commands, moderation and the post composer never run there.
+const BIZ = new Map();
+async function onBizConn(c, env) {
+  if (env.STATE && c.id && c.user?.id) await env.STATE.put("bc:" + c.id, String(c.user.id), { expirationTtl: 400 * 86400 }).catch(() => {});
+  const canReply = c.rights ? c.rights.can_reply !== false : c.can_reply !== false;
+  await notifyOwners(env, c.is_enabled === false ? "🔌 Chat automation ဖြုတ်လိုက်ပါပြီ" : "✅ <b>Chat automation ချိတ်ပြီးပါပြီ</b>\nCustomer တွေ ဆက်သွယ်ရင် Bot က ဖြေပေးပါမယ်" + (canReply ? "" : "\n⚠️ Bot မှာ <b>Reply to messages</b> ခွင့် မရှိသေးပါ (Business settings မှာ ဖွင့်ပေးပါ)"));
+}
+async function bizOwnerIs(env, m) {
+  if (idList(env.OWNER_IDS).includes(String(m.from.id))) return true;
+  const id = m.business_connection_id;
+  let owner = BIZ.get(id);
+  if (!owner && env.STATE) owner = await env.STATE.get("bc:" + id).catch(() => null);
+  if (!owner) owner = String((await tg(env, "getBusinessConnection", { business_connection_id: id }).catch(() => null))?.result?.user?.id || "");
+  if (owner) BIZ.set(id, owner);
+  return String(m.from.id) === String(owner);   // the account owner's own messages in the chat are never answered
+}
 async function handle(u, env) {
+  if (u.business_connection) return onBizConn(u.business_connection, env);
+  if (u.business_message) {
+    const bm = u.business_message;
+    if (!bm.business_connection_id || bm.chat?.type !== "private") return;
+    return handle({ message: bm }, { ...env, bc: bm.business_connection_id, biz: true });
+  }
   if (u.callback_query) return onCallback(u.callback_query, env);
   if (u.my_chat_member) return onMyChat(u.my_chat_member, env);
   const m = u.message;
@@ -3385,6 +4459,7 @@ async function handle(u, env) {
   const isGroup = m.chat.type === "group" || m.chat.type === "supergroup";
   const isPrivate = m.chat.type === "private";
   if (!isGroup && !isPrivate) return;
+  if (env.biz && (!m.from || m.from.is_bot || (await bizOwnerIs(env, m)))) return;
   // Group moderation runs on every message type (forwards, stickers, photos ...), before anything else.
   if (isGroup && (await moderate(m, env))) return;
   if (isGroup) await receiptDuplicateCheck(env, m, chat).catch((e) => console.error("dup", e));
@@ -3443,7 +4518,7 @@ async function handle(u, env) {
   // Access rules: groups are open to every member; private chat is owner-only (when OWNER_IDS is set).
   const owners = idList(env.OWNER_IDS);
   const isOwnerUser = owners.includes(String(m.from?.id));
-  if (isPrivate && owners.length && !isOwnerUser && S.dmopen === "off")
+  if (isPrivate && owners.length && !isOwnerUser && !env.biz && S.dmopen === "off")
     return send(env, chat, "🔒 ဒီ bot ကို သတ်မှတ်ထားတဲ့ group ထဲမှာပဲ သုံးလို့ရပါတယ်။");
   if (isPrivate && !isOwnerUser && env.STATE && !inDmHours()) {   // away note, once every 3 hours (the bot keeps answering)
     const ok = "off:" + m.from?.id;
@@ -3459,14 +4534,27 @@ async function handle(u, env) {
     await env.STATE.put("grp:" + chat, String(m.chat.title || "").slice(0, 60)).catch(() => {});
   }
 
+  // Calculator: /calc, or a message that is clearly a calculation (see calcHandle). Never touches ID / Server messages.
+  if (await calcHandle(env, m, chat, text, isGroup).catch((e) => { console.error("calc", e); return false; })) return;
+
   if (isPrivate && !isOwnerUser && /^\/(start|help|menu)(@\w+)?(\s|$)/i.test(text)) return sendCustomerMenu(env, chat, m.from?.id);
   const ucm = text.match(/^\/(myids|myorders|price|language|menu)(?:@\w+)?(?:\s+([\s\S]*))?$/i);
   if (ucm) return userCommand(env, m, chat, ucm[1].toLowerCase(), (ucm[2] || "").trim(), isPrivate);
+  // "List" / "list." / "/list": every game as a button, tap one = its price list (Copy + Close under it)
+  if (/^\/?lists?[\s.!။]*$/i.test(text)) return sendPricePicker(env, chat, await getLang(env, m.from?.id));
   if (/^\/(start|help)(@\w+)?(\s|$)/i.test(text)) {
-    if (isPrivate && owners.includes(String(m.from?.id))) await send({ ...env, replyTo: 0, junk: true }, chat, "⌨️ Menu ခလုတ်တွေ အောက်မှာ ပေါ်နေပါပြီ 👇", { reply_markup: mainKb() });
+    if (isPrivate && env.STATE && owners.includes(String(m.from?.id)) && !(await env.STATE.get("kbrm:" + m.from.id).catch(() => null))) {   // once: take the old bottom keyboard away
+      await env.STATE.put("kbrm:" + m.from.id, "1").catch(() => {});
+      await send({ ...env, replyTo: 0 }, chat, "☰ Menu ခလုတ် (စာရိုက်တဲ့ဘေး) ထဲက command တွေကို သုံးပါ", { reply_markup: { remove_keyboard: true } });
+    }
     const isAdm = owners.includes(String(m.from?.id)) || (isGroup && (await isAdmin(env, chat, m.from?.id)));   // the Admin button is shown to admins only
-    return sendCard(env, chat, MENU_TEXT, { reply_markup: helpMenu(isAdm, isPrivate) }, 10 * 60 * 1000);
+    return sendUi(env, chat, MENU_TEXT, helpRows(isAdm, isPrivate), 10 * 60 * 1000);
   } // group: removed after 10 min
+  if (/^\/health(@\w+)?\s*$/i.test(text)) return isOwnerUser ? showHealth({ ...env, replyTo: 0 }, chat) : undefined;
+  if (/^\/balance(@\w+)?\s*$/i.test(text)) {
+    if (isOwnerUser || (isGroup && (await isAdmin(env, chat, m.from?.id)))) return showBalance({ ...env, replyTo: 0 }, chat);
+    return;
+  }
   if (await adminCommand(env, m, text, isGroup, owners)) return;
   const cm = text.match(/^\/([A-Za-z0-9_]{2,20})(?:@\w+)?\s*$/);
   if (cm && S.cmds && S.cmds[cm[1].toLowerCase()]) return sendCard(env, chat, faqHtml(S.cmds[cm[1].toLowerCase()]));
@@ -3481,6 +4569,8 @@ async function handle(u, env) {
   if (/^\/reload(@\w+)?$/i.test(text)) {
     if (!owners.includes(String(m.from?.id))) return;
     CACHE = { t: 0, groups: null };
+    GDOCS = { t: 0, docs: null };
+    if (env.STATE) await env.STATE.delete("fs:games").catch(() => {});
     MEM.clear();
     SERVERS.clear();
     const fresh = await loadGroups(env);
@@ -3494,17 +4584,40 @@ async function handle(u, env) {
   const tgUser = text.match(isGroup ? /^(?:@|(?:https?:\/\/)?t\.me\/)([A-Za-z][A-Za-z0-9_]{3,31})$/i : /(?:^|\s)@([A-Za-z][A-Za-z0-9_]{3,31})(?=\s|$)|t\.me\/([A-Za-z][A-Za-z0-9_]{3,31})/i);
   if (tgUser) return checkTelegramUser(env, chat, tgUser[1] || tgUser[2]);
 
+  // "ml 86 x3 wp" (game + packages, no ID) -> price total. Only when every word is a known package, so chatter is left alone.
+  if (S.quote !== "off" && !text.startsWith("/") && !/\d{5,}/.test(text) && text.length <= 80 && /^[A-Za-z]/.test(text) && !(isGroup && isFormatted(m))) {
+    const q = await parseQuote(env, text).catch(() => null);
+    if (q) return sendQuote(env, chat, q);
+  }
+  // A game short name on its own ("ml", "pubgm") -> that game's price list (table).
+  if (!text.startsWith("/") && !/\d{5,}/.test(text) && /^[A-Za-z][A-Za-z0-9 ]{1,29}$/.test(text) && text.split(/\s+/).length <= 3) {
+    const hit = abbrGroups(await loadGroups(env), text, isPrivate);
+    if (hit.length === 1) return sendPrice(env, chat, hit[0], await getLang(env, m.from?.id));
+    if (hit.length > 1) return sendPricePicker(env, chat, await getLang(env, m.from?.id), hit);
+  }
+  // Admin buy: "ml 123456789 2002 86" -> no name check, buys straight from the G2Bulk wallet when it is enough. Admins only.
+  if (S.buy !== "off" && env.G2BULK_API_KEY && /^\.?[A-Za-z]{1,12}\b/.test(text) && /\d{5,}/.test(text) && !isFormatted(m)) {
+    if (isOwnerUser || (isGroup && (await isAdmin(env, chat, m.from?.id)))) {
+      const plan = await parseBuy(env, text);
+      if (plan) return doBuy(env, m, chat, plan);
+    }
+  }
+  // Customer order ("ml 123456789 2002 86 x3"; admins too when they cannot buy): the ID is checked and the card also shows packages + total.
+  if (S.orderpv !== "off" && /^\.?[A-Za-z]{1,12}\b/.test(text) && /\d{5,}/.test(text) && text.length <= 600 && !isFormatted(m)) {
+    const plan = await parseBuy(env, text).catch(() => null);
+    if (plan && (await orderPreview(env, m, chat, plan, isGroup))) return;
+  }
   // Groups: a number is only treated as a Player ID when it is written as ID(Server), or has "id" in front of it (or answers the bot's
   // own prompt / result card). Price lists, order numbers and chatter are left alone. /set idprefix off turns this off.
   const idStripped = isGroup ? stripIdWord(text) : null;
   const rt0 = m.reply_to_message?.text || "";
   const answersBot = !!m.reply_to_message?.from?.is_bot && (/🎮/.test(rt0) || isCardText(rt0));
-  const bracketForm = isGroup && /\d{5,}\s*[(（]\s*\d{1,6}\s*[)）]/.test(text);   // "123456789(2002)" is clear enough without "id"
-  if (isGroup && S.idprefix !== "off" && idStripped === null && !bracketForm && !answersBot) return;
+  const bracketForm = isGroup && (/\d{5,}\s*[(（]\s*\d{1,6}\s*[)）]/.test(text) || !!(() => { const q = parseInput(text); return q.id && q.server && /^\d{1,6}$/.test(q.server) && !q.query; })());   // "123456789(2002)" is clear enough without "id"
+  if (isGroup && S.idprefix === "on" && idStripped === null && !bracketForm && !answersBot) return;
   const p = parseInput(idStripped !== null ? idStripped : text);
   const repliedToBot = !!m.reply_to_message?.from?.is_bot;
   // In groups stay silent on normal chatter: only react to messages that look like a check.
-  if (isGroup && (!p.id || (!p.server && !p.query && !repliedToBot))) return;
+  if (isGroup && (!p.id || (S.idprefix === "on" && !p.server && !p.query && !repliedToBot))) return;
 
   const groups = await loadGroups(env);
   if (!groups.length) return send(env, chat, "⚠️ Game list မရနိုင်သေးပါ။ ခဏနေ ပြန်စမ်းပါ။");
@@ -3543,13 +4656,14 @@ async function handle(u, env) {
     // No game name: ID + Server only -> auto-scan every checkable game.
     return autoScan(env, chat, groups, id, server);
   } else if (id) {
-    // ID only, no game name -> scan the games that need no Server ID.
-    if (groups.some((g) => g.idOnly)) return autoScan(env, chat, groups, id, "");
-    return send(env, chat, "Server ID လိုပါတယ်\nဥပမာ: <code>" + esc(id) + "(2002)</code>");
+    // ID only, no game name -> check the games that need no Server ID (name + region); if there is none, ask for the Server ID.
+    if (groups.some((g) => !g.dropdown && g.idOnly)) return autoScan(env, chat, groups, id, "");
+    if (isGroup) return;   // group: a bare number with no ID-only game to check stays silent
+    return send(env, chat, "🖥 Server ID လိုပါတယ်\nဥပမာ: <code>" + esc(id) + "(2002)</code>");
   } else {
     group = known;
   }
-  if (!group) return isGroup ? undefined : isOwnerUser ? send(env, chat, MENU_TEXT, { reply_markup: helpMenu(true) }) : sendCustomerMenu(env, chat, m.from?.id);
+  if (!group) return isGroup ? undefined : isOwnerUser ? sendUi(env, chat, MENU_TEXT, helpRows(true, false)) : sendCustomerMenu(env, chat, m.from?.id);
   return runCheck(env, chat, group, id, server);
 }
 
@@ -3571,12 +4685,13 @@ const PAY_GROUPS = [
   { words: ["onepay", "one pay"], names: ["onepay"] },
 ];
 const PAY_GENERIC = [
-  "payment", "pay လုပ်", "pay နံပါတ်", "account number", "acc number", "ငွေလွှဲ", "ငွေလွဲ", "ငွေပေးချေ", "ငွေသွင်း", "ငွေပေး",
+  "payment", "pay", "paying", "transfer", "bank", "banking", "mobile banking", "pay လုပ်", "pay နံပါတ်", "account number", "acc number", "ငွေလွှဲ", "ငွေလွဲ", "ငွေပေးချေ", "ငွေသွင်း", "ငွေပေး",
+  "ဘဏ်", "လွှဲရ", "လွဲရ", "လွှဲမယ်", "လွဲမယ်", "ပေးရမ", "ပေးမယ်", "ပေးချေ", "ကျသင့်ငွေ", "ဘယ်လောက်လွှဲ", "ပိုက်ဆံလွှဲ", "ငွေကြေး",
   "အကောင့်နံပါတ်", "ဘယ်ကိုလွှဲ", "ဘယ်လိုလွှဲ", "ဘယ်လိုပေး", "ဘယ်နံပါတ်", "ဘဏ်နံပါတ်",
 ];
 let PAYM = { t: 0, list: [] };
 async function getPayMethods(env) {
-  if (PAYM.list.length && Date.now() - PAYM.t < 2 * 60 * 1000) return PAYM.list;
+  if (PAYM.list.length && Date.now() - PAYM.t < 10 * 60 * 1000) return PAYM.list;
   const out = [];
   let token = "";
   for (let i = 0; i < 3; i++) {
@@ -3631,7 +4746,7 @@ async function payWanted(env, text, forced) {
     methods.forEach((m) => { if (payNorm(m.name).includes(payNorm(key))) hit.set(m.id, m); });
   }
   if (hit.size) return { list: methods.filter((m) => hit.has(m.id)), all: false };
-  if (forced || (PAY_ASK.test(text) && PAY_GENERIC.some((w) => t.includes(w)))) return { list: methods, all: true };
+  if (forced || PAY_GENERIC.some((w) => t.includes(w))) return { list: methods, all: true };
   return { list: [], all: false };
 }
 const payPhone = (n) => String(n).replace(/[\s-]/g, "").slice(0, 256);
@@ -3670,7 +4785,7 @@ async function payAutoReply(env, chat, text, isGroup, forced = false) {
   const one = list.length === 1 ? list[0] : null;
   if (one && /^https:\/\//.test(one.qrImage || "")) {   // a single method with a QR: photo + the same card as caption
     const r = await tg(env, "sendPhoto", {
-      chat_id: chat, photo: one.qrImage, caption: html, parse_mode: "HTML", reply_markup: markup,
+      chat_id: chat, photo: one.qrImage, caption: html, parse_mode: "HTML", reply_markup: markup, ...(env.bc ? { business_connection_id: env.bc } : {}),
       ...(env.replyTo ? { reply_parameters: { message_id: env.replyTo, allow_sending_without_reply: true } } : {}),
     }).catch(() => null);
     if (r?.ok) {
@@ -3707,7 +4822,7 @@ async function autoScan(env, chat, groups, id, server) {
   groups = groups.filter((g) => !g.dropdown && (server ? !g.idOnly : g.idOnly));
   if (!groups.length) return;
   if (await limited(env, chat)) return;
-  const note = await send(env, chat, `🔍 <b>စစ်နေပါတယ်...</b>\n🆔 <code>${esc(id)}</code>${server ? ` (${esc(server)})` : ""}`);
+  const note = env.biz ? null : await send(env, chat, `🔍 <b>စစ်နေပါတယ်...</b>\n🆔 <code>${esc(id)}</code>${server ? ` (${esc(server)})` : ""}`);
   const noteId = note?.result?.message_id;
   const started = Date.now();
 
@@ -3817,10 +4932,16 @@ async function onCallback(q, env) {
   }
   if (tag === "nr") return tg(env, "answerCallbackQuery", { callback_query_id: q.id, text: "Reject လုပ်ပြီးသား ဖြစ်ပါတယ်" });
 
-  if (["mi", "pr", "mo", "pm", "lg"].includes(tag)) return customerCallback(env, q, chat, tag, gid);
+  if (tag === "bl") {   // Balance button: owners and group admins only
+    const okb = owners.includes(String(q.from.id)) || (inGroup && (await isAdmin(env, chat, q.from.id)));
+    if (!okb) return tg(env, "answerCallbackQuery", { callback_query_id: q.id, text: "⛔ Admin ပဲ ကြည့်လို့ရပါတယ်", show_alert: true });
+    await tg(env, "answerCallbackQuery", { callback_query_id: q.id });
+    return showBalance({ ...env, replyTo: 0 }, chat);
+  }
+  if (["mi", "pr", "mo", "pm", "lg", "px"].includes(tag)) return customerCallback(env, q, chat, tag, gid, id);
 
   // Post composer buttons (owner, private chat): target picker, schedule / channel / template / sent-post actions.
-  if (["pt", "ps", "pc", "pa", "pz", "tu", "td", "sm", "sa", "pk"].includes(tag)) {
+  if (["pt", "ps", "pc", "pa", "pz", "pk"].includes(tag)) {
     if (inGroup || !env.STATE || !owners.includes(String(q.from.id)))
       return tg(env, "answerCallbackQuery", { callback_query_id: q.id, text: "⛔ Owner ပဲ သုံးလို့ရပါတယ်", show_alert: true });
     return postCallback(q, { ...env, junk: true });
@@ -3848,9 +4969,9 @@ async function onCallback(q, env) {
     await tg(env, "answerCallbackQuery", { callback_query_id: q.id });
     if (!page) return;
     const priv = q.message.chat.type === "private";
-    const back = (to) => ({ inline_keyboard: [[{ text: "⬅️ ပြန်သွားရန်", callback_data: "h:" + to, style: "primary" }, ...(priv ? closeRow() : [])]] });
-    const markup = gid === "0" ? helpMenu(owners.includes(String(q.from.id)) || (inGroup && (await isAdmin(env, chat, q.from.id))), priv) : gid === "a" ? adminMenu() : back(gid[0] === "a" ? "a" : "0");
-    return tg(env, "editMessageText", { chat_id: chat, message_id: q.message.message_id, text: page, parse_mode: "HTML", reply_markup: markup });
+    const rows = gid === "0" ? helpRows(owners.includes(String(q.from.id)) || (inGroup && (await isAdmin(env, chat, q.from.id))), priv) : gid === "a" ? adminRows() : [[{ text: "⬅️ ပြန်သွားရန်", data: "h:" + (gid[0] === "a" ? "a" : "0"), style: "primary" }, ...(priv ? [CLOSE_BTN] : [])]];
+    await tg(env, "deleteMessage", { chat_id: chat, message_id: q.message.message_id }).catch(() => {});
+    return sendUi({ ...env, replyTo: 0 }, chat, page, rows, inGroup ? 10 * 60 * 1000 : undefined);
   }
 
   // Copy Name / Copy ID (old cards only, new cards use native copy buttons): only the person who asked, group admins, or the bot owner.
@@ -3921,6 +5042,7 @@ function pickServer(group, server) {
 }
 function chooseServer(env, chat, group, id) {
   const opts = dropOptions(group).slice(0, 16);
+  if (env.biz && opts.length) return send(env, chat, `🎮 <b>${esc(group.name)}</b> <code>${esc(id)}</code>\n\nServer နာမည် ရိုက်ပြီး ပြန်ပို့ပါ:\n` + opts.map((o) => "• " + esc(o.label)).join("\n"));
   if (!opts.length) return send(env, chat, `ℹ️ <b>${esc(group.name)}</b> ရဲ့ Server စာရင်း မတွေ့ပါ`);
   const rows = [];
   opts.forEach((o, i) => {
@@ -3932,6 +5054,7 @@ function chooseServer(env, chat, group, id) {
 
 function chooseGame(env, chat, found, id, server) {
   const list = found.slice(0, 8);
+  if (env.biz) return send(env, chat, "🎮 Game နာမည်အပြည့် ရိုက်ပြီး ပြန်ပို့ပါ:\n" + list.map((g) => "• " + esc(g.name)).join("\n"));
   const rows = list.map((g) => [{ text: g.name, callback_data: `g:${g.id}:${id}:${server}`.slice(0, 64), style: "primary" }]);
   const more = found.length > list.length ? "\n\n(ပိုတိကျအောင် နာမည်အပြည့်ရိုက်ပါ)" : "";
   return send(env, chat, `🎮 Game ရွေးပါ${more}`, { reply_markup: { inline_keyboard: rows } });
@@ -4007,7 +5130,11 @@ async function sendValid(env, chat, group, results, id, server, maxCards = Infin
   const picked = [...byName.values()].sort((x, y) => Number(!!y.matches) - Number(!!x.matches)).slice(0, maxCards);
   for (const { g, g2, r } of picked) {
     // Card: Game / name (quote + bold) / ID (Server). cardInfo() parses this shape back.
-    const card = cardText(group.name, `✅ ${esc(r.name)}`, `<code>${esc(id)}</code>${!group.idOnly && server ? ` (${esc(server)})` : ""}`);
+    // ID-only check (no Server ID): the card shows name + region. Region = what the provider reports, else the Server ID table.
+    const showServer = !group.idOnly && !!server;
+    const region = showServer ? "" : fmtRegion((r.geo && r.geo.region) || regionFromServerId(g.g2bulkCode, server));
+    const ox = env.orderExtra;   // customer order: packages + total under the ID line
+    const card = cardText(group.name, `✅ ${esc(r.name)}`, `<code>${esc(id)}</code>${showServer ? ` (${esc(server)})` : ""}${region ? `\n🌍 ${esc(region)}` : ""}${ox ? `\n\n${ox.html}` : ""}`);
     const copyBtn =
       S.copyid === "restricted" && env.requester
         ? { text: "Copy ID", callback_data: `i:${env.requester}`, style: "primary", ...ic(env, "ICON_COPY") }   // only the asker / admins / owners
@@ -4019,6 +5146,7 @@ async function sendValid(env, chat, group, results, id, server, maxCards = Infin
     if (wantsDone) rows.push(doneRejectRow(env.requester, env));   // group: admins mark the order done or rejected (side by side, one row)
     const sent = await sendCard(env, chat, bq(card), { reply_markup: { inline_keyboard: rows } });
     const info = { g: group.name, i: id, s: group.idOnly ? "" : server };
+    if (ox && env.STATE && sent?.result?.message_id) await env.STATE.put(`pv:${chat}:${sent.result.message_id}`, JSON.stringify({ p: Math.round(ox.price), c: Math.round(ox.cost || 0), n: ox.n }), { expirationTtl: ORDER_TTL_S }).catch(() => {});
     if (wantsDone && Number(chat) < 0) {
       await trackPending(env, chat, sent?.result?.message_id, info, env.requester);
       if (env.STATE) await env.STATE.delete(`rcpt:${chat}:${env.requester}`).catch(() => {});   // one receipt = one order
