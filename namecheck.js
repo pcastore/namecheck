@@ -123,7 +123,7 @@ const RESERVED_CMDS = [
   "start", "help", "id", "reload", "setwelcome", "welcome", "captcha", "addword", "delword", "words", "stats", "addfaq", "delfaq",
   "faqs", "setstore", "setdone", "adminhelp", "orders", "warns", "unwarn", "unban", "addalias", "delalias", "aliases", "settings",
   "set", "maint", "seticon", "emojiid", "summary", "addcmd", "delcmd", "cmds", "hidegame", "showgame", "announce", "groups", "lock", "unlock",
-  "calc", "change", "list", "post", "posts", "delpost", "addchannel", "delchannel", "channels", "pay", "pkgs", "setpkg", "delpkg", "balance", "health",
+  "addpay", "delpay", "calc", "change", "list", "post", "posts", "delpost", "addchannel", "delchannel", "channels", "pay", "pkgs", "setpkg", "delpkg", "balance", "health",
 ];
 const FULL_PERMS = {
   can_send_messages: true, can_send_audios: true, can_send_documents: true, can_send_photos: true, can_send_videos: true,
@@ -488,7 +488,7 @@ function fv(v) {
 // with the ID only. Games with a fixed server dropdown are checked after the game name is typed: the player taps the server (or types its name).
 function baseOk(g) {
   if (!g || !g.name) return false;
-  if (["g2bulk_voucher", "fazercard_giftcard", "jcplays", "voucher_manual"].includes(g.fulfillProvider)) return false;
+  if (["g2bulk_voucher", "jcplays", "voucher_manual"].includes(g.fulfillProvider)) return false;
   if (g.g2bulkVoucherCategory) return false;
   if (g.playerIdRequired === false) return false;
   if (/heartopia/i.test(g.name)) return false;
@@ -544,6 +544,24 @@ async function loadGameDocs(env) {
   GDOCS = { t: Date.now(), docs };
   if (env.STATE) await env.STATE.put("fs:games", JSON.stringify(GDOCS), { expirationTtl: 900 }).catch(() => {});
   return docs;
+}
+// Price list games: EVERY store game that has priced packages (vouchers / games without name check included).
+let PGC = { src: null, groups: null };
+async function loadPriceGroups(env) {
+  const docs = await loadGameDocs(env);
+  if (PGC.groups && PGC.src === docs) return PGC.groups;
+  const map = new Map();
+  for (const g of docs) {
+    if (!g || !g.name || !Array.isArray(g.packages) || !g.packages.some((p) => p && p.amount && Number(p.price) > 0)) continue;
+    const key = g.name.trim().toLowerCase();
+    if (!map.has(key)) map.set(key, { key, id: hash(key), name: g.name.trim(), entries: [], order: Infinity });
+    const grp = map.get(key);
+    grp.entries.push(g);
+    if (typeof g.order === "number") grp.order = Math.min(grp.order, g.order);
+  }
+  const groups = [...map.values()].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
+  if (groups.length) PGC = { src: docs, groups };
+  return groups.length ? groups : PGC.groups || [];
 }
 let CACHE = { t: 0, groups: null };
 async function loadGroups(env) {
@@ -1121,21 +1139,25 @@ async function buildSummary(env, back = 0) {
   const sales = rows.filter((x) => x.p > 0).concat(await listOrders(env, `sale:${dayStr(back)}:`, () => true));
   const per = {};
   rows.forEach((x) => (per[x.a] = (per[x.a] || 0) + 1));
-  const adm = Object.entries(per).sort((a, b) => b[1] - a[1]).map(([a, n]) => `• ${esc(String(a).slice(0, 25))} — ${n}`).join("\n");
-  const top = Object.entries(s.games || {}).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([g, n]) => `• ${esc(g)} — ${n}`).join("\n");
-  return (
-    `📊 <b>${esc(label)} စာရင်းချုပ်</b>\n\n🔎 စစ်ခဲ့တာ: ${(s.found || 0) + (s.notfound || 0)}\n✅ တွေ့: ${s.found || 0}\n❌ မတွေ့: ${s.notfound || 0}\n📦 Done: ${rows.length}` + salesText(sales) +
-    (adm ? `\n\n👤 Admin အလိုက် Done\n${adm}` : "") +
-    (top ? `\n\n🎮 အများဆုံး\n${top}` : "")
-  );
+  const cards = [kvCard(`📊 ${label} စာရင်းချုပ်`, [
+    ["🔎 စစ်ခဲ့တာ", String((s.found || 0) + (s.notfound || 0))], ["✅ တွေ့", String(s.found || 0)], ["❌ မတွေ့", String(s.notfound || 0)], ["📦 Done", String(rows.length)], ...salesRows(sales),
+  ])];
+  const adm = Object.entries(per).sort((a, b) => b[1] - a[1]).map(([a, n]) => [esc(String(a).slice(0, 25)), String(n)]);
+  if (adm.length) cards.push(gridCard("👤 Admin အလိုက် Done", ["Admin", "Done"], adm, [1]));
+  const top = Object.entries(s.games || {}).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([g, n]) => [esc(g), String(n)]);
+  if (top.length) cards.push(gridCard("🎮 အများဆုံး", ["Game", "စစ်"], top, [1]));
+  return joinCards(cards);
 }
 // sales = rows with p (selling price) and optionally c (cost): admin-bought orders and customer orders that were marked Done
-function salesText(sales) {
-  if (!sales.length) return "";
+function salesRows(sales) {
+  if (!sales.length) return [];
   const rev = sales.reduce((s, x) => s + (x.p || 0), 0);
   const known = sales.filter((x) => x.c > 0);
   const profit = known.reduce((s, x) => s + (x.p - x.c), 0);
-  return `\n\n💰 ရောင်းရငွေ: ${fmtKs(rev)} Ks (${sales.length} order)` + (known.length ? `\n📈 အမြတ်: ${fmtKs(profit)} Ks${known.length < sales.length ? ` (cost သိတဲ့ ${known.length}/${sales.length} order ကိုပဲ တွက်)` : ""}` : "");
+  return [
+    ["💰 ရောင်းရငွေ", `${fmtKs(rev)} Ks (${sales.length} order)`],
+    known.length ? ["📈 အမြတ်", `${fmtKs(profit)} Ks${known.length < sales.length ? ` (cost သိတဲ့ ${known.length}/${sales.length} order ကိုပဲ တွက်)` : ""}`] : null,
+  ];
 }
 async function buildWeek(env) {
   let found = 0, notfound = 0, done = 0;
@@ -1151,9 +1173,13 @@ async function buildWeek(env) {
     done += rows.length;
     rows.forEach((x) => (per[x.a] = (per[x.a] || 0) + 1));
   }
-  const fmt = (o) => Object.entries(o).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `• ${esc(String(k).slice(0, 25))} — ${n}`).join("\n");
-  return `📊 <b>ရက် ၇ ရက် စာရင်းချုပ်</b>\n(ကောင်တာက ၃ ရက်ပဲ သိမ်းလို့ စစ်တာအရေအတွက်က နောက်ဆုံး ၃ ရက်စာပါ၊ Done က ၇ ရက်စာ)\n\n🔎 စစ်ခဲ့တာ: ${found + notfound} (✅ ${found} · ❌ ${notfound})\n📦 Done: ${done}` + salesText(allSales) +
-    (done ? `\n\n👤 Admin အလိုက်\n${fmt(per)}` : "") + (Object.keys(games).length ? `\n\n🎮 အများဆုံး\n${fmt(games)}` : "");
+  const fmt = (o) => Object.entries(o).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => [esc(String(k).slice(0, 25)), String(n)]);
+  const cards = [kvCard("📊 ရက် ၇ ရက် စာရင်းချုပ်", [
+    ["🔎 စစ်ခဲ့တာ", `${found + notfound} (✅ ${found} · ❌ ${notfound})`], ["📦 Done", String(done)], ...salesRows(allSales),
+  ], "ကောင်တာက ၃ ရက်ပဲ သိမ်းလို့ စစ်တာအရေအတွက်က နောက်ဆုံး ၃ ရက်စာပါ၊ Done က ၇ ရက်စာ")];
+  if (done) cards.push(gridCard("👤 Admin အလိုက်", ["Admin", "Done"], fmt(per), [1]));
+  if (Object.keys(games).length) cards.push(gridCard("🎮 အများဆုံး", ["Game", "စစ်"], fmt(games), [1]));
+  return joinCards(cards);
 }
 async function dailySummary(env) {
   if (!env.STATE || S.summary === "off") return;
@@ -1164,7 +1190,7 @@ async function dailySummary(env) {
   const key = "sum:" + dayStr();
   if (await env.STATE.get(key).catch(() => null)) return;
   await env.STATE.put(key, "1", { expirationTtl: 3 * 86400 });   // mark first, so two overlapping sweeps send it once
-  await notifyOwners(env, await buildSummary(env, 0));
+  await notifyCard(env, await buildSummary(env, 0));
 }
 
 /* ---------- Warnings: 1-2 warning, 3 mute, after that ban ---------- */
@@ -1529,6 +1555,7 @@ const ADMIN_PAGES = {
       "<code>/faqs</code> စာရင်း · <code>/delfaq ဈေး</code> (သို့) <code>/delfaq 2</code>",
       "",
       "<b>💳 Payment auto-reply ပြင်ရန်</b>",
+      "<code>/addpay KPay | 09123456789 | U Mg Mg</code> ကိုယ်တိုင်ထည့် · <code>/delpay KPay</code> (Store ကနေ မဖတ်ရရင် ဒါနဲ့ရ)",
       "<code>/paywords</code> စာရင် · <code>/payword kpay = ကေပေး, kbzpay</code> · <code>/delpayword kpay</code>",
       "<code>/paymsg လွှဲပြီး receipt ပို့ပါ</code> (ကတ်အောက်က စာ၊ ဖျက်ရန် <code>/paymsg off</code>) · <code>/set pay on|off</code>",
       "Group မှာ Member အားလုံးအတွက် အလုပ်လုပ်ပါတယ်၊ ပြင်လို့ရတာက Owner (DM) နဲ့ Group admin ပဲ",
@@ -1610,7 +1637,7 @@ const adminRows = () => {
   return [[b("a1"), b("a2")], [b("a3"), b("a4")], [b("a5"), b("a6")], [b("a7"), b("a8")], [{ text: "⬅️ ပြန်သွားရန်", data: "h:0", style: "primary" }]];
 };
 async function adminCommand(env, m, text, isGroup, owners) {
-  const mm = text.match(/^\/(lock|unlock|hidegame|showgame|announce|groups|addalias|delalias|aliases|settings|set|maint|seticon|emojiid|summary|addcmd|delcmd|cmds|setwelcome|welcome|captcha|addword|delword|words|stats|paymsg|payword|delpayword|paywords|addfaq|delfaq|faqs|setstore|setdone|adminhelp|orders|warns|unwarn|unban|pkgs|setpkg|delpkg)(?:@\w+)?(?:\s+([\s\S]*))?$/i);
+  const mm = text.match(/^\/(lock|unlock|hidegame|showgame|announce|groups|addalias|delalias|aliases|settings|set|maint|seticon|emojiid|summary|addcmd|delcmd|cmds|setwelcome|welcome|captcha|addword|delword|words|stats|paymsg|payword|delpayword|paywords|addpay|delpay|addfaq|delfaq|faqs|setstore|setdone|adminhelp|orders|warns|unwarn|unban|pkgs|setpkg|delpkg)(?:@\w+)?(?:\s+([\s\S]*))?$/i);
   if (!mm) return false;
   const cmd = mm[1].toLowerCase();
   const arg = (mm[2] || "").trim();
@@ -1642,15 +1669,16 @@ async function adminCommand(env, m, text, isGroup, owners) {
 
   if (cmd === "stats") {
     if (!isOwner) return true;
-    const fmt = async (label, back) => {
-      const s = await env.STATE.get(dayKey(back), "json").catch(() => null);
-      if (!s) return `<b>${label}</b>\nစစ်ထားတာ မရှိသေးပါ`;
-      const top = Object.entries(s.games || {}).sort((a, b) => b[1] - a[1]).slice(0, 5)
-        .map(([g, n]) => `• ${esc(g)} — ${n}`).join("\n");
-      return `<b>${label}</b>\n🔎 စစ်ခဲ့တာ: ${(s.found || 0) + (s.notfound || 0)}\n✅ တွေ့: ${s.found || 0}\n❌ မတွေ့: ${s.notfound || 0}` +
-        (top ? `\n🎮 အများဆုံး\n${top}` : "");
-    };
-    await say("📊 <b>Stats</b>\n\n" + (await fmt("ဒီနေ့", 0)) + "\n\n" + (await fmt("မနေ့က", 1)));
+    const rowsD = [], tops = {};
+    for (const [label, back] of [["ဒီနေ့", 0], ["မနေ့က", 1]]) {
+      const st = (await env.STATE.get(dayKey(back), "json").catch(() => null)) || {};
+      rowsD.push([label, String((st.found || 0) + (st.notfound || 0)), String(st.found || 0), String(st.notfound || 0)]);
+      for (const [g, n] of Object.entries(st.games || {})) tops[g] = (tops[g] || 0) + n;
+    }
+    const topRows = Object.entries(tops).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([g, n]) => [esc(g), String(n)]);
+    const cards = [gridCard("📊 Stats", ["ရက်", "စစ်", "✅ တွေ့", "❌ မတွေ့"], rowsD, [1, 2, 3])];
+    if (topRows.length) cards.push(gridCard("🎮 အများဆုံး", ["Game", "စစ်"], topRows, [1]));
+    await sendRT({ ...env, replyTo: 0 }, chat, joinCards(cards), {}, 10 * 60 * 1000);
     return true;
   }
 
@@ -1670,7 +1698,8 @@ async function adminCommand(env, m, text, isGroup, owners) {
         return true;
       }
       const shown = rows.slice(-25);
-      await say(`🔎 <code>${esc(arg)}</code> — Done ${rows.length} ကြိမ်\n\n` + shown.map((x) => line(x, true)).join("\n") + (rows.length > shown.length ? `\n\n(နောက်ဆုံး ${shown.length} ခုပဲ ပြထားတယ်)` : ""), 5 * 60 * 1000);
+      await sendRT({ ...env, replyTo: 0 }, chat, gridCard(`🔎 ${arg} — Done ${rows.length} ကြိမ်`, ["ရက် / အချိန်", "Game", "Server", "Admin", "Member"],
+        shown.map((x) => [`${mmDay(x.t)} ${mmTime(x.t)}`, cut(x.g, 22), x.s ? esc(x.s) : "-", cut(x.a, 20), x.mn ? cut(x.mn, 20) : "-"]), [], rows.length > shown.length ? `နောက်ဆုံး ${shown.length} ခုပဲ ပြထားတယ်` : ""), {}, 5 * 60 * 1000);
       return true;
     }
     let nameQ = "";
@@ -1692,12 +1721,12 @@ async function adminCommand(env, m, text, isGroup, owners) {
     const sum = Object.entries(per).sort((a, b) => b[1] - a[1]).map(([a, n]) => `${cut(a, 20)} ${n}`).join(" · ");
     const shown = rows.slice(-30);
     const base = rows.length - shown.length;
-    await say(
-      `📋 <b>${label} Done ပြီးတဲ့ order</b> — ${rows.length} ခု\n👤 ${sum}\n\n` +
-        shown.map((x, i) => `${base + i + 1}. ${line(x, false)}`).join("\n") +
-        (base ? `\n\n(နောက်ဆုံး ${shown.length} ခုပဲ ပြထားတယ်)` : ""),
-      5 * 60 * 1000
-    );
+    await sendRT({ ...env, replyTo: 0 }, chat, joinCards([
+      kvCard(`📋 ${label} Done ပြီးတဲ့ order`, [["📦 စုစုပေါင်း", String(rows.length)], ["👤 Admin", sum]]),
+      gridCard("", ["#", "အချိန်", "Game", "ID (Server)", "Admin"],
+        shown.map((x, i) => [String(base + i + 1), mmTime(x.t), cut(x.g, 22), `<code>${esc(x.i || "?")}</code>${x.s ? `(${esc(x.s)})` : ""}`, cut(x.a, 20)]), [0],
+        base ? `နောက်ဆုံး ${shown.length} ခုပဲ ပြထားတယ်` : ""),
+    ]), {}, 5 * 60 * 1000);
     return true;
   }
 
@@ -2015,7 +2044,7 @@ async function adminCommand(env, m, text, isGroup, owners) {
 
   // ----- daily summary now -----
   if (cmd === "summary") {
-    await say(/^week$/i.test(arg) ? await buildWeek(env) : await buildSummary(env, /^\d{1,2}$/.test(arg) ? Math.min(Number(arg), 29) : 0), 5 * 60 * 1000);
+    await sendRT({ ...env, replyTo: 0 }, chat, /^week$/i.test(arg) ? await buildWeek(env) : await buildSummary(env, /^\d{1,2}$/.test(arg) ? Math.min(Number(arg), 29) : 0), {}, 5 * 60 * 1000);
     return true;
   }
 
@@ -2081,6 +2110,33 @@ async function adminCommand(env, m, text, isGroup, owners) {
 
   // ----- FAQ auto-reply -----
   // ----- Payment auto-reply editing: /paymsg /payword /delpayword /paywords -----
+  // ----- payment methods added by hand (works even when the store's Firestore list cannot be read) -----
+  if (cmd === "addpay" || cmd === "delpay") {
+    const cur = await env.STATE.get("cfg:pay", "json").catch(() => null);
+    let list = Array.isArray(cur) ? cur : [];
+    const show = () => list.length ? list.map((x) => `• <b>${esc(x.name)}</b> <code>${esc(x.number)}</code> ${esc(x.accountName || "")}`).join("\n") : "မရှိသေးပါ";
+    if (cmd === "delpay") {
+      const k = arg.toLowerCase();
+      const left = k ? list.filter((x) => String(x.name).toLowerCase() !== k) : list;
+      if (!k || left.length === list.length) { await usage("ဖျက်ရန်: <code>/delpay KPay</code>\n\nလက်ရှိ:\n" + show()); return true; }
+      await env.STATE.put("cfg:pay", JSON.stringify(left));
+      PAYM = { t: 0, list: [] };
+      await say(`🗑 <b>${esc(arg)}</b> ဖျက်ပြီးပါပြီ`, 2 * 60 * 1000);
+      return true;
+    }
+    const [n, no, acc, note, qr] = arg.split("|").map((x) => x.trim());
+    if (!n || !no || n.length > 30 || no.length > 40) {
+      await usage("ဥပမာ:\n<code>/addpay KPay | 09123456789 | U Mg Mg</code>\n<code>/addpay Wave | 09987654321 | Daw Mya | မနက် ၉ - ည ၉</code>\n(နာမည် | နံပါတ် | အကောင့်နာမည် | အချိန်မှတ်ချက် | QR ပုံ https link — နောက်ဆုံး ၂ ခု မထည့်လည်းရ)\nနာမည်တူရင် အသစ်နဲ့ အစားထိုး\n\nလက်ရှိ:\n" + show());
+      return true;
+    }
+    list = list.filter((x) => String(x.name).toLowerCase() !== n.toLowerCase());
+    list.push({ name: n, number: no, accountName: (acc || "").slice(0, 60), availabilityNote: (note || "").slice(0, 80), ...(qr && /^https:\/\/\S+$/.test(qr) ? { qrImage: qr.slice(0, 500) } : {}) });
+    await env.STATE.put("cfg:pay", JSON.stringify(list.slice(-12)));
+    PAYM = { t: 0, list: [] };
+    if (isGroup) await tg(env, "deleteMessage", { chat_id: chat, message_id: m.message_id }).catch(() => {});
+    await say(`✅ <b>${esc(n)}</b> ထည့်ပြီးပါပြီ (စုစုပေါင်း ${Math.min(list.length, 12)})\n<code>kpay</code> လို့ ရိုက်ရင် Bot က ဖြေပါမယ်`, 2 * 60 * 1000);
+    return true;
+  }
   if (cmd === "paymsg" || cmd === "payword" || cmd === "delpayword" || cmd === "paywords") {
     if (cmd === "paywords") {
       const pw = Object.entries(S.payWords || {});
@@ -2886,6 +2942,66 @@ async function postCallback(q, env) {
 /* ---------- Rich UI (Bot API 10.3): table + button grid in one message, replaces the inline keyboards ---------- */
 // Buttons are written once as { text, data | url, style } rows; sendUi() sends them as a rich message
 // (every label cut / padded to the same length, so the buttons look even) and falls back to a normal inline keyboard.
+// Equal-width inline buttons (same model as the Game Store bot): every button in a row gets the same width and every row is
+// stretched to the widest row, using invisible U+2800 filler, so left / right edges line up.
+const BTN_FILL = "⠀";
+const BTN_PX_PER_EM = 38.5, BTN_PAD_PX = 110, BTN_GAP_PX = 20, BTN_ICON_PX = 33, BTN_FILL_EM = 0.73, BTN_SPACE_EM = 0.278;
+const BTN_EM_ASCII = [278,278,355,556,556,889,667,191,333,333,389,584,278,333,278,278,556,556,556,556,556,556,556,556,556,556,278,278,584,584,584,556,1015,667,667,722,722,667,611,778,722,278,500,667,556,833,722,778,667,778,722,667,611,722,667,944,667,667,611,278,278,278,469,556,333,556,556,500,556,556,278,556,556,222,222,500,222,833,556,556,556,556,333,500,278,556,500,722,500,500,500,334,260,334,584];
+function btnEm(t) {
+  let w = 0;
+  for (const ch of Array.from(String(t || ""))) {
+    const c = ch.codePointAt(0);
+    if (ch === BTN_FILL) w += BTN_FILL_EM;
+    else if (c >= 32 && c <= 126) w += BTN_EM_ASCII[c - 32] / 1000;
+    else if (ch === "·") w += 0.333;
+    else if (ch === "…" || ch === "—") w += 1;
+    else if (/[ါ-ှၖ-ၙၞ-ၠၢ-ၤၧ-ၭၱ-ၴႂ-ႍႏႚ-ႝ]/.test(ch)) continue;   // Burmese marks sit on the base letter
+    else w += 0.9;
+  }
+  return w;
+}
+const btnIconPx = (b) => (b && (b.url || b.web_app) ? BTN_ICON_PX : 0);
+const btnNaturalPx = (b) => BTN_PX_PER_EM * btnEm(b && b.text) + BTN_PAD_PX + btnIconPx(b);
+function padToEm(text, targetEm) {
+  const gap = targetEm - btnEm(text);
+  if (gap < 0.25) return text;
+  let k = Math.floor(gap / BTN_FILL_EM);
+  const rem = gap - k * BTN_FILL_EM;
+  let m = Math.round(rem / BTN_SPACE_EM);
+  if (Math.abs(BTN_FILL_EM - rem) < Math.abs(rem - m * BTN_SPACE_EM)) { k += 1; m = 0; }
+  if (k === 0) { if (gap < BTN_FILL_EM / 2) return text; k = 1; m = 0; }
+  const a = Math.ceil(k / 2), b = k - a;
+  const sl = b ? Math.ceil(m / 2) : m, sr = m - sl;   // spaces sit between filler and text (edge spaces would be trimmed)
+  return BTN_FILL.repeat(a) + " ".repeat(sl) + text + " ".repeat(sr) + BTN_FILL.repeat(b);
+}
+function padKeyboardEven(rows) {
+  rows = rows.filter((r) => Array.isArray(r) && r.length);
+  if (!rows.length) return rows;
+  const rowMax = rows.map((r) => Math.max(...r.map(btnNaturalPx)));
+  const rowTotal = rows.map((r, i) => r.length * rowMax[i] + (r.length - 1) * BTN_GAP_PX);
+  const R = Math.max(...rowTotal);
+  return rows.map((r, i) => {
+    const per = Math.max(rowMax[i], (R - (r.length - 1) * BTN_GAP_PX) / r.length);
+    return r.map((b) => (b && typeof b.text === "string" ? { ...b, text: padToEm(b.text, (per - BTN_PAD_PX - btnIconPx(b)) / BTN_PX_PER_EM) } : b));
+  });
+}
+// Grid of name buttons, `cols` per row, long names cut with "…", the last row padded with inert "·" buttons, all the same width.
+function evenButtonGrid(btns, cols = 2, padData = "noop:x") {
+  const cap = cols === 3 ? 4.8 : cols === 2 ? 9 : 20;
+  const cut = (text) => {
+    if (btnEm(text) <= cap) return text;
+    let out = "";
+    for (const ch of Array.from(text)) { if (btnEm(out + ch) > cap - 0.5) break; out += ch; }
+    return out + "…";
+  };
+  let cells = btns.map((b) => ({ ...b, text: cut(String(b.text || "")) }));
+  if (cols > 1) while (cells.length % cols) cells.push({ text: "·", data: padData });
+  const target = cells.reduce((m, b) => Math.max(m, btnEm(b.text)), 0);
+  cells = cells.map((b) => ({ ...b, text: padToEm(b.text, target) }));
+  const rows = [];
+  for (let i = 0; i < cells.length; i += cols) rows.push(cells.slice(i, i + cols));
+  return rows;
+}
 const CLOSE_BTN = { text: "❌ ပိတ်", data: "pz:c", style: "danger" };
 const qa = (s) => esc(String(s)).replace(/"/g, "&quot;");
 const vlen = (s) => [...String(s)].filter((c) => !/\p{M}/u.test(c)).length;
@@ -2900,8 +3016,8 @@ function fitLabel(t, n) {
   const pad = Math.max(0, n - v);
   return "\u2800".repeat(Math.floor(pad / 2)) + out + "\u2800".repeat(Math.ceil(pad / 2));
 }
-const evenRows = (rows, n = 14) => rows.filter((r) => r.length).map((r) => r.map((b) => ({ ...b, text: fitLabel(b.text, n) })));
-const toInline = (rows) => rows.map((r) => r.map((b) => ({ text: b.text, ...(b.url ? { url: b.url } : { callback_data: b.data }), ...(b.style ? { style: b.style } : {}) })));
+const evenRows = (rows) => padKeyboardEven(rows);
+const toInline = (rows) => padKeyboardEven(rows).map((r) => r.map((b) => ({ text: b.text, ...(b.url ? { url: b.url } : { callback_data: b.data }), ...(b.style ? { style: b.style } : {}) })));
 const rbtn = (b) => `<tg-button type="${b.url ? "url" : "callback_data"}"${b.style ? ` style="${b.style}"` : ""} ${b.url ? `url="${qa(b.url)}"` : `data="${qa(b.data)}"`}>${esc(b.text)}</tg-button>`;
 const rrows = (rows) => rows.map((r) => `<tg-button-row align="center">${r.map(rbtn).join("")}</tg-button-row>`).join("");
 // Telegram-HTML text (b / i / code, \n) -> rich paragraphs
@@ -2969,9 +3085,10 @@ async function parseQuote(env, text) {
   return null;
 }
 async function sendQuote(env, chat, q) {
-  const html = `🎮 <b>${esc(q.group.name)}</b>\n\n${quoteLines(q.quote)}\n━━━━━━━━\n💰 <b>Total: ${fmtKs(q.quote.total)} Ks</b>`;
+  const card = gridCard(`🎮 ${q.group.name}`, ["Package", "Qty", "Price (Ks)"],
+    [...q.quote.items.map((x) => [esc(String(x.p.amount)), String(x.qty), fmtKs(x.sub)]), ["<b>Total</b>", "", `<b>${fmtKs(q.quote.total)}</b>`]], [1, 2]);
   const copy = { text: "Copy", copy_text: { text: String(Math.round(q.quote.total)) }, style: "primary", ...ic(env, "ICON_COPY") };
-  return sendCard(env, chat, html, { reply_markup: { inline_keyboard: [[copy]] } });
+  return sendRT(env, chat, card, { reply_markup: { inline_keyboard: [[copy]] } });
 }
 const adminTags = async (env, chat) => {
   const r = await tg(env, "getChatAdministrators", { chat_id: chat }).catch(() => null);
@@ -3036,6 +3153,10 @@ async function calcChangeEval(env, c) {
 function calcChangeHtml(r) {
   const head = r.diff > 0 ? `<b>ပြန်အမ်း: ${fmtKs(r.diff)} Ks</b>` : r.diff === 0 ? "✅ <b>အတိအကျ ပေးထားပါတယ်</b>" : `⚠️ <b>ငွေ လိုနေသေး: ${fmtKs(-r.diff)} Ks</b>`;
   return `💵 <b>ပြန်အမ်းငွေ</b>\nပေးငွေ: ${fmtKs(r.paid)} Ks\nဈေး: ${fmtKs(r.price)} Ks\n━━━━━━━━\n${head}`;
+}
+function calcChangeCard(r) {
+  const head = r.diff > 0 ? `<b>ပြန်အမ်း: ${fmtKs(r.diff)} Ks</b>` : r.diff === 0 ? "✅ <b>အတိအကျ ပေးထားပါတယ်</b>" : `⚠️ <b>ငွေ လိုနေသေး: ${fmtKs(-r.diff)} Ks</b>`;
+  return kvCard("💵 ပြန်အမ်းငွေ", [["ပေးငွေ", `${fmtKs(r.paid)} Ks`], ["ဈေး", `${fmtKs(r.price)} Ks`], ["ရလဒ်", head]]);
 }
 const CUR_WORD = "(?:usd|dollars?|mmk|ks|kyat|ကျပ်|\\$)";
 const curOf = (w) => (/^(?:usd|dollars?|\$)$/i.test(w) ? "usd" : /^(?:mmk|ks|kyat|ကျပ်)$/i.test(w) ? "mmk" : "");
@@ -3495,7 +3616,7 @@ async function calcHandle(env, m, chat, text, isGroup) {
     const one = lines[0];
     const chg = calcChangeParse(one);   // "paid 50000 price 45000" (the price may be a package list: "paid 20000 price ml 86 x3")
     if (chg) {
-      try { await sendCard(env, chat, calcChangeHtml(await calcChangeEval(env, chg))); return true; }
+      try { await sendRT(env, chat, calcChangeCard(await calcChangeEval(env, chg))); return true; }
       catch (e) { if (!(e instanceof CalcErr)) throw e; if (!cmd) return false; }
     }
     const cur = calcCurrencyParse(one);   // "50 usd to mmk": uses the store's USD rate, so only owners / group admins
@@ -3505,7 +3626,7 @@ async function calcHandle(env, m, chat, text, isGroup) {
         const rate = await storeRate(env);
         if (!rate) { await send(env, chat, esc(NO_RATE)); return true; }
         const o = calcCurrencyOut(cur, rate);
-        await sendCard(env, chat, `💱 <b>${esc(o.text)}</b>\n<i>rate ${esc(String(rate))}</i>`, { reply_markup: { inline_keyboard: [[{ text: "Copy", copy_text: { text: String(Math.round(o.y * 100) / 100) }, style: "primary", ...ic(env, "ICON_COPY") }]] } });
+        await sendRT(env, chat, kvCard("💱 USD ↔ Ks", [["ပြောင်းလဲ", `<b>${esc(o.text)}</b>`], ["Rate", esc(String(rate))]]), { reply_markup: { inline_keyboard: [[{ text: "Copy", copy_text: { text: String(Math.round(o.y * 100) / 100) }, style: "primary", ...ic(env, "ICON_COPY") }]] } });
         return true;
       }
       if (cmd) { await send(env, chat, "⛔ Admin ပဲ သုံးလို့ရပါတယ်"); return true; }
@@ -3532,32 +3653,32 @@ async function calcHandle(env, m, chat, text, isGroup) {
   }
   if (!cmd && !meaningful) return false;
 
-  let html, plain;
+  let card, plain;
   if (rows.length === 1) {
     const r = rows[0];
-    if (r.conv) { html = `🔄 <b>${esc(r.conv.text)}</b>`; plain = r.conv.plain; }
+    if (r.conv) { card = kvCard("🔄 Unit", [["ပြောင်းလဲ", `<b>${esc(r.conv.text)}</b>`]]); plain = r.conv.plain; }
     else {
       const f = calcFmt(r.v);
       plain = f.plain;
       CALC_ANS.set(uid, r.v);
       if (CALC_ANS.size > 2000) CALC_ANS.clear();
       const abs = Math.abs(r.v);
-      const lakh = abs >= 1e5 && abs < 1e12 ? `\n<i>≈ ${esc(calcFmt(Math.round((r.v / 1e5) * 100) / 100).pretty)} သိန်း</i>` : "";
-      html = `🧮 <b>Calculator</b>\n<blockquote>${esc(calcNormalize(r.src))}</blockquote>\n<b>= ${esc(f.pretty)}</b>${lakh}`;
+      const lakhRow = abs >= 1e5 && abs < 1e12 ? ["≈ သိန်း", esc(calcFmt(Math.round((r.v / 1e5) * 100) / 100).pretty)] : null;
+      card = kvCard("🧮 Calculator", [["Expression", `<code>${esc(calcNormalize(r.src))}</code>`], ["Result", `<b>${esc(f.pretty)}</b>`], lakhRow]);
     }
   } else {
     let total = 0;
     const out = rows.map((r, k) => {
       total += r.v;
-      return `${k + 1}) <code>${esc(calcNormalize(r.src))}</code> = <b>${esc(calcFmt(r.v).pretty)}</b>`;
+      return [String(k + 1), `<code>${esc(calcNormalize(r.src))}</code>`, `<b>${esc(calcFmt(r.v).pretty)}</b>`];
     });
     const f = calcFmt(total);
     plain = f.plain;
     CALC_ANS.set(uid, total);
-    html = `🧮 <b>Calculator</b>\n${out.join("\n")}\n━━━━━━━━\n<b>Σ Total = ${esc(f.pretty)}</b>`;
+    card = gridCard("🧮 Calculator", ["#", "Expression", "Result"], [...out, ["Σ", "<b>Total</b>", `<b>${esc(f.pretty)}</b>`]], [2]);
   }
   const copy = { text: "Copy", copy_text: { text: String(plain).slice(0, 256) }, style: "primary", ...ic(env, "ICON_COPY") };
-  await sendCard(env, chat, html, { reply_markup: { inline_keyboard: [[copy]] } });
+  await sendRT(env, chat, card, { reply_markup: { inline_keyboard: [[copy]] } });
   return true;
 }
 
@@ -3742,19 +3863,71 @@ async function freshPackages(env, group) {
   }
   return out;
 }
-async function sendPricePicker(env, chat, lang, list) {
-  const groups = list || (await loadGroups(env));
+const PICK_PAGE = 8;
+async function sendPricePicker(env, chat, lang, list, page = 0) {
+  const groups = list || (await loadPriceGroups(env));
   if (!groups.length) return send(env, chat, L(lang, "noPrice"));
-  const btns = groups.slice(0, 60).map((g) => ({ text: g.name, data: `pr:${g.id}`, style: "primary" }));
-  const rows = [];
-  for (let i = 0; i < btns.length; i += 2) rows.push(btns.slice(i, i + 2));
+  const pages = Math.max(1, Math.ceil(groups.length / PICK_PAGE));
+  page = Math.min(Math.max(0, Number(page) || 0), pages - 1);
+  const slice = groups.slice(page * PICK_PAGE, page * PICK_PAGE + PICK_PAGE);
+  const rows = evenButtonGrid(slice.map((g) => ({ text: g.name, data: `pr:${g.id}`, style: "primary" })), 2);
+  if (!list && pages > 1) {
+    const prev = page > 0 ? { text: "Prev", data: `pr:l:${page - 1}` } : { text: "·", data: "noop:x" };
+    const next = page < pages - 1 ? { text: "Next", data: `pr:l:${page + 1}` } : { text: "·", data: "noop:x" };
+    rows.push([prev, next]);
+  }
   rows.push([closeBtn(env)]);
-  return sendUi(env, chat, L(lang, "pickGame"), rows, 5 * 60 * 1000, 16);
+  const head = L(lang, "pickGame") + (!list && pages > 1 ? `\n<i>Page ${page + 1}/${pages} · ${groups.length} games</i>` : "");
+  return sendUi(env, chat, head, rows, 5 * 60 * 1000);
 }
 // "px:c:<uid>" closes (deletes) a list / price message: the person who opened it, or an admin / owner. "px:y:<gameId>:<tab>" = Copy.
 const closeBtn = (env) => ({ text: "Close", data: `px:c:${env.requester || env.uid || 0}`, style: "danger" });
 // Bot API 10.3 rich message (sendRichMessage + HTML): heading, compact table and a button row inside the message.
 // Returns true when Telegram accepted it. Any error -> false, and the caller sends the plain text version instead.
+/* ---------- Table cards: every info card = bordered rich table (+ plain fallback). Buttons ride along as reply_markup. ---------- */
+const unh = (h) => String(h).replace(/<[^>]+>/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").replace(/&quot;/g, '"');
+const kvRichT = (rows) => `<table bordered>${rows.filter(Boolean).map(([k, v]) => `<tr><td><b>${k}</b></td><td>${v}</td></tr>`).join("")}</table>`;
+// rows = [[label, html value]] ; foot = html
+function kvCard(title, rows, foot = "") {
+  const rs = rows.filter(Boolean);
+  return {
+    rich: (title ? `<h3>${esc(title)}</h3>` : "") + kvRichT(rs) + (foot ? `<p><i>${foot}</i></p>` : ""),
+    plain: (title ? `<b>${esc(title)}</b>\n` : "") + rs.map(([k, v]) => `<b>${k}:</b> ${v}`).join("\n") + (foot ? `\n<i>${foot}</i>` : ""),
+  };
+}
+// head = plain text, rows = [[html cell]] ; right = right-aligned columns
+function gridCard(title, head, rows, right = [], foot = "") {
+  const al = (c) => (right.includes(c) ? ' align="right"' : "");
+  const rich =
+    (title ? `<h3>${esc(title)}</h3>` : "") +
+    `<table bordered><tr>${head.map((h) => `<td align="center"><b>${esc(h)}</b></td>`).join("")}</tr>` +
+    rows.map((r) => `<tr>${r.map((v, c) => `<td${al(c)}>${v}</td>`).join("")}</tr>`).join("") + `</table>` + (foot ? `<p><i>${foot}</i></p>` : "");
+  const all = [head, ...rows.map((r) => r.map(unh))].map((r) => r.map(String));
+  const w = head.map((_, c) => Math.max(...all.map((r) => vlen(r[c]))));
+  const pad = (v, n, left) => (left ? " ".repeat(Math.max(0, n - vlen(v))) + v : v + " ".repeat(Math.max(0, n - vlen(v))));
+  const fmt = (r) => r.map((v, c) => (c === head.length - 1 ? v : pad(v, w[c], right.includes(c)))).join("  ");
+  const bar = "-".repeat(w.reduce((x, y) => x + y, 0) + 2 * (head.length - 1));
+  const plain = (title ? `<b>${esc(title)}</b>\n` : "") + `<pre>${esc([fmt(all[0]), bar, ...all.slice(1).map(fmt)].join("\n"))}</pre>` + (foot ? `\n<i>${foot}</i>` : "");
+  return { rich, plain };
+}
+const joinCards = (cs) => ({ rich: cs.map((c) => c.rich).join(""), plain: cs.map((c) => c.plain).join("\n\n") });
+// rich table first; plain text when rich is off / refused
+async function sendRT(env, chat, card, extra = {}, ms) {
+  if (S.rich !== "off" && !env.bc) {
+    const r = await sendRichCard(env, chat, card.rich, extra, ms);
+    if (r) return r;
+  }
+  return sendCard(env, chat, card.plain, extra, ms);
+}
+async function notifyCard(env, card) {
+  await Promise.all(idList(env.OWNER_IDS).map(async (o) => {
+    if (S.rich !== "off") {
+      const r = await tg(env, "sendRichMessage", { chat_id: o, rich_message: { html: card.rich } }).catch(() => null);
+      if (r?.ok) return;
+    }
+    await tg(env, "sendMessage", { chat_id: o, text: card.plain, parse_mode: "HTML" }).catch(() => {});
+  }));
+}
 async function sendRichCard(env, chat, html, extra, ms) {
   const r = await tg(env, "sendRichMessage", {
     chat_id: chat,
@@ -3906,7 +4079,7 @@ async function userCommand(env, m, chat, cmd, arg, isPrivate) {
   const lang = await getLang(env, uid);
   if (cmd === "price") {
     if (!arg) return sendPricePicker(env, chat, lang);
-    const groups = await loadGroups(env);
+    const groups = await loadPriceGroups(env);
     const found = findGroups(groups, arg);
     if (found.length === 1) return sendPrice(env, chat, found[0], lang);
     if (found.length > 1) return sendPricePicker(env, chat, lang, found);
@@ -3931,7 +4104,7 @@ async function customerCallback(env, q, chat, tag, arg, extra) {
     }
     if (parts[1] === "y") {
       await tg(env, "answerCallbackQuery", { callback_query_id: q.id });
-      const group = (await loadGroups(env)).find((g) => g.id === parts[2]);
+      const group = (await loadPriceGroups(env)).find((g) => g.id === parts[2]);
       if (!group) return;
       await tg(env, "deleteMessage", { chat_id: chat, message_id: q.message.message_id }).catch(() => {});   // the Copy view takes the table's place
       return sendPrice({ ...env, replyTo: 0 }, chat, group, await getLang(env, uid), parts[3] === undefined || parts[3] === "" ? undefined : Number(parts[3]), "copy");
@@ -3956,8 +4129,8 @@ async function customerCallback(env, q, chat, tag, arg, extra) {
   }
   if (tag === "pr") {   // game list -> catalog -> price table: each tap replaces the screen (the old message is removed), so only one message is ever left
     const swap = () => tg(env, "deleteMessage", { chat_id: chat, message_id: q.message.message_id }).catch(() => {});
-    if (arg === "l") { await swap(); return sendPricePicker({ ...env, replyTo: 0 }, chat, lang); }
-    const group = (await loadGroups(env)).find((g) => g.id === arg);
+    if (arg === "l") { await swap(); return sendPricePicker({ ...env, replyTo: 0 }, chat, lang, undefined, Number(extra) || 0); }
+    const group = (await loadPriceGroups(env)).find((g) => g.id === arg);
     if (!group) return send(env, chat, L(lang, "noPrice"));
     await swap();
     return sendPrice({ ...env, replyTo: 0 }, chat, group, lang, extra === undefined || extra === "" ? undefined : Number(extra));
@@ -4263,7 +4436,7 @@ async function g2Balance(env) {
 let RATE = { t: 0, v: 0, src: "" };
 async function storeRate(env) {
   if (RATE.v && Date.now() - RATE.t < 30 * 1000) return RATE.v;
-  for (const docName of ["publicRates", "g2bulk"]) {
+  for (const docName of ["publicRates"]) {
     try {
       const qs = new URLSearchParams({ key: env.FIREBASE_API_KEY || FS_KEY });
       qs.append("mask.fieldPaths", "usdRate");
@@ -4288,9 +4461,8 @@ async function showBalance(env, chat) {
   const bal = await g2Balance(env);
   if (bal === null) return sendCard(env, chat, "Balance မဖတ်နိုင်ပါ၊ ခဏနေ ပြန်စမ်းပါ", {}, 60 * 1000);
   const rate = await storeRate(env);
-  const lines = ["<b>💰 G2Bulk Wallet</b>", `<blockquote><b>${bal.toFixed(2)} USD</b>${rate ? ` · ${Math.round(bal * rate).toLocaleString("en-US")} Ks\nRate ${rate}` : ""}</blockquote>`];
-  if (!rate) lines.push(esc(NO_RATE));
-  return sendCard(env, chat, lines.join("\n"), {}, 2 * 60 * 1000);
+  const card = kvCard("💰 G2Bulk Wallet", [["USD", `<b>${bal.toFixed(2)}</b>`], rate ? ["Ks", fmtKs(bal * rate)] : null, rate ? ["Rate", String(rate)] : null], rate ? "" : esc(NO_RATE));
+  return sendRT(env, chat, card, {}, 2 * 60 * 1000);
 }
 // /health (owner): one screen with everything that can break.
 async function showHealth(env, chat) {
@@ -4306,26 +4478,24 @@ async function showHealth(env, chat) {
   const age = GDOCS.t ? Math.round((Date.now() - GDOCS.t) / 1000) + " စက္ကန့်အရင်" : "—";
   const w = wh?.result || {};
   const down = ["G2Bulk"].filter((p) => PH.get(p)?.down);
-  const lines = [
-    "🩺 <b>System အခြေအနေ</b>",
-    "",
-    `${ok(groups.length)} Game list: ${groups.length} (Firestore ဖတ်ထားတာ ${age})`,
-    `${ok(pay.length)} Payment method: ${pay.length}`,
-    `${ok(rate)} USD rate: ${rate ? rate + " (Admin panel)" : "မဖတ်နိုင် — settings/publicRates စစ်ပါ"}`,
-    `${ok(!down.length)} Provider: ${down.length ? "🚨 ကျနေ — " + down.join(", ") : "G2Bulk ကောင်း"}`,
-    bal === undefined ? "➖ Wallet: G2BULK_API_KEY မထည့်ရသေး" : `${ok(bal !== null)} Wallet: ${bal === null ? "မဖတ်နိုင်" : bal.toFixed(2) + " USD (" + (rate ? "~" + Math.round(bal * rate).toLocaleString("en-US") + " Ks" : "rate မရ") + ")"}`,
-    `${ok(env.STATE)} Storage: ${env.DB ? "D1" : env.STATE ? "KV" : "မရှိ (auto-delete / မှတ်တမ်း မရ)"}`,
-    `${ok(!w.last_error_message)} Webhook: pending ${w.pending_update_count ?? "?"}${w.last_error_message ? " · " + esc(String(w.last_error_message).slice(0, 80)) : ""}`,
-    `${S.maint === "on" ? "🛠 Maintenance ဖွင့်ထား" : "🟢 Maintenance ပိတ်ထား"}`,
-    `⏱ ${Date.now() - t0} ms`,
-  ];
-  return sendCard(env, chat, lines.join("\n"), {}, 5 * 60 * 1000);
+  const card = kvCard("🩺 System အခြေအနေ", [
+    ["Game list", `${ok(groups.length)} ${groups.length} (Firestore ဖတ်ထားတာ ${age})`],
+    ["Payment method", `${ok(pay.length)} ${pay.length}${pay.length ? "" : PAYERR ? " — " + esc(PAYERR) : ""}`],
+    ["USD rate", `${ok(rate)} ${rate ? rate + " (Admin panel)" : "မဖတ်နိုင် — settings/publicRates စစ်ပါ"}`],
+    ["Provider", `${ok(!down.length)} ${down.length ? "🚨 ကျနေ — " + down.join(", ") : "G2Bulk ကောင်း"}`],
+    ["Wallet", bal === undefined ? "➖ G2BULK_API_KEY မထည့်ရသေး" : `${ok(bal !== null)} ${bal === null ? "မဖတ်နိုင်" : bal.toFixed(2) + " USD (" + (rate ? "~" + fmtKs(bal * rate) + " Ks" : "rate မရ") + ")"}`],
+    ["Storage", `${ok(env.STATE)} ${env.DB ? "D1" : env.STATE ? "KV" : "မရှိ (auto-delete / မှတ်တမ်း မရ)"}`],
+    ["Webhook", `${ok(!w.last_error_message)} pending ${w.pending_update_count ?? "?"}${w.last_error_message ? " · " + esc(String(w.last_error_message).slice(0, 80)) : ""}`],
+    ["Maintenance", S.maint === "on" ? "🛠 ဖွင့်ထား" : "🟢 ပိတ်ထား"],
+    ["Speed", `${Date.now() - t0} ms`],
+  ]);
+  return sendRT(env, chat, card, {}, 5 * 60 * 1000);
 }
 // Clear table, no emoji: rich message (bordered table) first, plain monospace table as the fallback.
 function buyTable(title, head, rows, right, foot) {
   const al = (c) => (right.includes(c) ? ' align="right"' : "");
   const rich =
-    `<p><b>${esc(title)}</b></p><table compact><tr>${head.map((h, c) => `<td${al(c)}><b>${esc(h)}</b></td>`).join("")}</tr>` +
+    `<p><b>${esc(title)}</b></p><table bordered><tr>${head.map((h, c) => `<td${al(c)}><b>${esc(h)}</b></td>`).join("")}</tr>` +
     rows.map((r) => `<tr>${r.map((v, c) => `<td${al(c)}>${c === 0 ? `<code>${esc(v)}</code>` : esc(v)}</td>`).join("")}</tr>`).join("") +
     `</table>` + (foot ? `<p>${foot}</p>` : "");
   const all = [head, ...rows].map((r) => r.map(String));
@@ -4630,7 +4800,7 @@ async function handle(u, env) {
   }
   // A game short name on its own ("ml", "pubgm") -> that game's price list (table).
   if (!text.startsWith("/") && !/\d{5,}/.test(text) && /^[A-Za-z][A-Za-z0-9 ]{1,29}$/.test(text) && text.split(/\s+/).length <= 3) {
-    const hit = abbrGroups(await loadGroups(env), text, isPrivate);
+    const hit = abbrGroups(await loadPriceGroups(env), text, isPrivate);
     if (hit.length === 1) return sendPrice(env, chat, hit[0], await getLang(env, m.from?.id));
     if (hit.length > 1) return sendPricePicker(env, chat, await getLang(env, m.from?.id), hit);
   }
@@ -4729,30 +4899,16 @@ const PAY_GENERIC = [
   "အကောင့်နံပါတ်", "ဘယ်ကိုလွှဲ", "ဘယ်လိုလွှဲ", "ဘယ်လိုပေး", "ဘယ်နံပါတ်", "ဘဏ်နံပါတ်",
 ];
 let PAYM = { t: 0, list: [] };
+let PAYERR = "";   // why the store's payment list could not be read (shown in /health)
+// The store keeps payment accounts admin-only in Firestore (rules), so the bot cannot read them.
+// Payment methods are added from the bot itself: /addpay KPay | 09123456789 | U Mg Mg   (kept in storage).
 async function getPayMethods(env) {
-  if (PAYM.list.length && Date.now() - PAYM.t < 10 * 60 * 1000) return PAYM.list;
-  const out = [];
-  let token = "";
-  for (let i = 0; i < 3; i++) {
-    const qs = new URLSearchParams({ pageSize: "100", key: env.FIREBASE_API_KEY || FS_KEY });
-    ["name", "number", "accountName", "availabilityNote", "qrImage", "order"].forEach((f) => qs.append("mask.fieldPaths", f));
-    if (token) qs.set("pageToken", token);
-    let j;
-    try {
-      const r = await fetch(`https://firestore.googleapis.com/v1/projects/${FS_PROJECT}/databases/(default)/documents/paymentMethods?${qs}`);
-      if (!r.ok) break;
-      j = await r.json();
-    } catch { break; }
-    (j.documents || []).forEach((d) => {
-      const o = fv({ mapValue: { fields: d.fields || {} } }) || {};
-      if (o.name && o.number) out.push({ id: d.name.split("/").pop(), ...o });
-    });
-    token = j.nextPageToken || "";
-    if (!token) break;
-  }
-  out.sort((a, b) => (typeof a.order === "number" ? a.order : 1e9) - (typeof b.order === "number" ? b.order : 1e9));
-  if (out.length) PAYM = { t: Date.now(), list: out };
-  return out.length ? out : PAYM.list;
+  if (PAYM.list.length && Date.now() - PAYM.t < 2 * 60 * 1000) return PAYM.list;
+  const custom = env.STATE ? await env.STATE.get("cfg:pay", "json").catch(() => null) : null;
+  const out = (Array.isArray(custom) ? custom : []).filter((c) => c && c.name && c.number).map((c, i) => ({ id: "c" + i, order: i, ...c }));
+  PAYERR = out.length ? "" : "မထည့်ရသေးပါ — /addpay KPay | 09123456789 | နာမည် နဲ့ ထည့်ပါ (Store ရဲ့ Firestore rules က Bot ကို မဖတ်ခွင့်ပေးထားလို့)";
+  PAYM = { t: Date.now(), list: out };
+  return out;
 }
 const payNorm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9\u1000-\u109f]/g, "");
 // Latin words must stand alone ("aya" must not fire inside "maya"); Burmese words just need to be contained.
@@ -4797,6 +4953,14 @@ function payCard(list) {
     (m.availabilityNote ? `\n🕐 ${esc(m.availabilityNote)}` : "")
   ).join("\n\n") + (S.payMsg ? "\n\n" + tplHtml(S.payMsg) : "");
 }
+function payRich(list) {
+  const extra = S.payMsg ? `<p>${tplHtml(S.payMsg)}</p>` : "";
+  if (list.length === 1) {
+    const m = list[0];
+    return kvRichT([["💳 Method", `<b>${esc(m.name)}</b>`], ["👤 Name", `<code>${esc(m.accountName || "-")}</code>`], ["📱 Number", `<code>${esc(m.number)}</code>`], m.availabilityNote ? ["🕐 Time", esc(m.availabilityNote)] : null]) + extra;
+  }
+  return gridCard("", ["Method", "Name", "Number"], list.map((m) => [`<b>${esc(m.name)}</b>`, `<code>${esc(m.accountName || "-")}</code>`, `<code>${esc(m.number)}</code>`]), []).rich + extra;
+}
 function payButtons(env, list) {
   const single = list.length === 1;
   const rows = [];
@@ -4832,7 +4996,7 @@ async function payAutoReply(env, chat, text, isGroup, forced = false) {
       return true;
     }
   }
-  await sendCard(env, chat, html, { reply_markup: markup });
+  await sendRT(env, chat, { rich: payRich(list), plain: html }, { reply_markup: markup });
   return true;
 }
 
@@ -4912,7 +5076,15 @@ async function autoScan(env, chat, groups, id, server) {
   if (scanned.length && scanned.every((r) => r.outcome === "unknown")) return busy(env, chat, scanned, partial);
   await stat(env, "notfound", null);
   await notFoundWatch(env, chat).catch(() => {});
-  return sendCard(env, chat, cardText("", "❌ Player Not found", `<code>${esc(id)}</code>${server ? ` (${esc(server)})` : ""}\n(${server ? "ID / Server ID ကို စစ်ကြည့်ပါ" : "ID ကို စစ်ကြည့်ပါ၊ Server ID ရှိရင် ထည့်ပို့ပါ"})`) + partial);
+  return sendRT(env, chat, notFoundCard("", id, server, server ? "ID / Server ID ကို စစ်ကြည့်ပါ" : "ID ကို စစ်ကြည့်ပါ၊ Server ID ရှိရင် ထည့်ပို့ပါ", partial.trim()));
+}
+
+
+// Not-found card: bordered table (plain card = old shape, so replies to it still work)
+function notFoundCard(game, id, server, hint, extraHtml = "") {
+  const card = kvCard("", [game ? ["Game", esc(game)] : null, ["Status", "<b>❌ Player Not found</b>"], ["ID", `<code>${esc(id)}</code>`], server ? ["Server", `<code>${esc(server)}</code>`] : null, hint ? ["Note", esc(hint)] : null]);
+  const plain = cardText(game, "❌ Player Not found", `<code>${esc(id)}</code>${server ? ` (${esc(server)})` : ""}${hint ? `\n(${esc(hint)})` : ""}`);
+  return { rich: card.rich + (extraHtml ? `<p>${extraHtml}</p>` : ""), plain: plain + (extraHtml ? "\n\n" + extraHtml : "") };
 }
 
 async function onCallback(q, env) {
@@ -5086,20 +5258,16 @@ function chooseServer(env, chat, group, id) {
   const opts = dropOptions(group).slice(0, 16);
   if (env.biz && opts.length) return send(env, chat, `🎮 <b>${esc(group.name)}</b> <code>${esc(id)}</code>\n\nServer နာမည် ရိုက်ပြီး ပြန်ပို့ပါ:\n` + opts.map((o) => "• " + esc(o.label)).join("\n"));
   if (!opts.length) return send(env, chat, `ℹ️ <b>${esc(group.name)}</b> ရဲ့ Server စာရင်း မတွေ့ပါ`);
-  const rows = [];
-  opts.forEach((o, i) => {
-    const b = { text: o.label.slice(0, 30), callback_data: `g:${group.id}:${id}:#${i}`.slice(0, 64), style: "primary" };
-    if (i % 2 === 0) rows.push([b]); else rows[rows.length - 1].push(b);
-  });
-  return send(env, chat, `🎮 <b>${esc(group.name)}</b>\n<code>${esc(id)}</code>\n\nServer ရွေးပါ 👇`, { reply_markup: { inline_keyboard: rows } });
+  const rows = evenButtonGrid(opts.map((o, i) => ({ text: o.label, data: `g:${group.id}:${id}:#${i}`.slice(0, 64), style: "primary" })), 2);
+  return send(env, chat, `🎮 <b>${esc(group.name)}</b>\n<code>${esc(id)}</code>\n\nServer ရွေးပါ 👇`, { reply_markup: { inline_keyboard: toInline(rows) } });
 }
 
 function chooseGame(env, chat, found, id, server) {
   const list = found.slice(0, 8);
   if (env.biz) return send(env, chat, "🎮 Game နာမည်အပြည့် ရိုက်ပြီး ပြန်ပို့ပါ:\n" + list.map((g) => "• " + esc(g.name)).join("\n"));
-  const rows = list.map((g) => [{ text: g.name, callback_data: `g:${g.id}:${id}:${server}`.slice(0, 64), style: "primary" }]);
+  const rows = evenButtonGrid(list.map((g) => ({ text: g.name, data: `g:${g.id}:${id}:${server}`.slice(0, 64), style: "primary" })), 2);
   const more = found.length > list.length ? "\n\n(ပိုတိကျအောင် နာမည်အပြည့်ရိုက်ပါ)" : "";
-  return send(env, chat, `🎮 Game ရွေးပါ${more}`, { reply_markup: { inline_keyboard: rows } });
+  return send(env, chat, `🎮 Game ရွေးပါ${more}`, { reply_markup: { inline_keyboard: toInline(rows) } });
 }
 
 function ask(env, chat, group, text, placeholder) {
@@ -5146,11 +5314,7 @@ async function runCheck(env, chat, group, id, server) {
   const serverProblem = rs.some((r) => r.reason === "server");
   await stat(env, "notfound", group.name);
   await notFoundWatch(env, chat).catch(() => {});
-  return sendCard(
-    env,
-    chat,
-    cardText(group.name, "❌ Player Not found", `<code>${esc(id)}</code>${server ? ` (${esc(server)})` : ""}${serverProblem ? "\n(Server ID ကို စစ်ကြည့်ပါ)" : ""}`)
-  );
+  return sendRT(env, chat, notFoundCard(group.name, id, server, serverProblem ? "Server ID ကို စစ်ကြည့်ပါ" : ""));
 }
 
 // Checks every region entry of a game through its own provider (identical calls are shared by the cache).
