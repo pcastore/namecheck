@@ -513,6 +513,7 @@ function hash(s) {
 const GAME_FIELDS = [...FS_FIELDS, "packages", "packageTabLabels", "packageTabs"];
 const GAMES_TTL_MS = 5 * 60 * 1000;
 let GDOCS = { t: 0, docs: null };
+let GCOLL = "";   // which collection answered last: "games" (full, has Cost) or "gamesPublic" (Cost-free mirror, used when the rules keep `games` admin-only)
 async function loadGameDocs(env) {
   if (GDOCS.docs && Date.now() - GDOCS.t < GAMES_TTL_MS) return GDOCS.docs;
   if (env.STATE) {
@@ -520,22 +521,25 @@ async function loadGameDocs(env) {
     if (s && Array.isArray(s.docs) && Date.now() - s.t < GAMES_TTL_MS) { GDOCS = s; return s.docs; }
   }
   const docs = [];
-  let token = "";
-  for (let i = 0; i < 10; i++) {
-    const qs = new URLSearchParams({ pageSize: "300", key: env.FIREBASE_API_KEY || FS_KEY });
-    GAME_FIELDS.forEach((f) => qs.append("mask.fieldPaths", f));
-    if (token) qs.set("pageToken", token);
-    let j;
-    try {
-      const r = await fetch(`https://firestore.googleapis.com/v1/projects/${FS_PROJECT}/databases/(default)/documents/games?${qs}`);
-      if (!r.ok) break;
-      j = await r.json();
-    } catch {
-      break;
+  for (const coll of GCOLL === "gamesPublic" ? ["gamesPublic", "games"] : ["games", "gamesPublic"]) {
+    let token = "";
+    for (let i = 0; i < 10; i++) {
+      const qs = new URLSearchParams({ pageSize: "300", key: env.FIREBASE_API_KEY || FS_KEY });
+      GAME_FIELDS.forEach((f) => qs.append("mask.fieldPaths", f));
+      if (token) qs.set("pageToken", token);
+      let j;
+      try {
+        const r = await fetch(`https://firestore.googleapis.com/v1/projects/${FS_PROJECT}/databases/(default)/documents/${coll}?${qs}`);
+        if (!r.ok) break;
+        j = await r.json();
+      } catch {
+        break;
+      }
+      (j.documents || []).forEach((d) => docs.push(fv({ mapValue: { fields: d.fields || {} } })));
+      token = j.nextPageToken || "";
+      if (!token) break;
     }
-    (j.documents || []).forEach((d) => docs.push(fv({ mapValue: { fields: d.fields || {} } })));
-    token = j.nextPageToken || "";
-    if (!token) break;
+    if (docs.length) { GCOLL = coll; break; }
   }
   if (!docs.length) return GDOCS.docs || [];   // Firestore failed: keep serving the old copy
   GDOCS = { t: Date.now(), docs };
@@ -2280,8 +2284,11 @@ const PL = {
   redo: "🔄 Content ပြန်ပို့", album: "📸 Album", done: "✔️ ပြီးပြီ",
 };
 const ML = { new: "📝 Post တင်ရန်", list: "⏰ Schedule စာရင်း", chn: "📢 Channels", help: "ℹ️ အကူအညီ", bal: "💰 Balance" };
-const POST_HELP_TEXT =
-  "ℹ️ <b>Post တင်နည်း</b>\n\n1️⃣ ☰ Menu ထဲက <b>/post</b> → နေရာရွေး → စာ/ပုံ/video ပို့\n2️⃣ Button + 🎨 Color၊ 📌 Pin၊ 🔔 Silent၊ 📸 Album\n3️⃣ 👀 Preview ကြည့်ပြီး ✅ ယခုတင် (သို့) ⏰ အချိန်ခွဲတင် (repeat ရ)\n\n📢 Channel: Bot ကို channel မှာ admin လုပ်ရုံ (သို့) 📢 Channels ထဲက ➕\n👥 Group တွေက အလိုလိုမှတ်ပါတယ်";
+const POST_HELP_TEXT = [
+  "<b>📝 Post တင်နည်း</b>",
+  "<blockquote>1️⃣ <b>/post</b> → နေရာရွေး → စာ / ပုံ / video ပို့\n2️⃣ Button + 🎨 Color · 📌 Pin · 🔔 Silent · 📸 Album\n3️⃣ 👀 Preview ကြည့်ပြီး ✅ ယခုတင် (သို့) ⏰ အချိန်ခွဲတင် (repeat ရ)</blockquote>",
+  "<blockquote>📢 <b>Channel</b> — Bot ကို channel မှာ admin လုပ်ရုံ (သို့) 📢 Channels ထဲက ➕\n👥 <b>Group</b> တွေက အလိုလိုမှတ်ပါတယ်</blockquote>",
+].join("\n");
 const WL = { h1: "⏰ +1 နာရီ", h3: "⏰ +3 နာရီ", night: "🌙 ည ၉ နာရီ", morn: "🌅 မနက် ၉ နာရီ" };
 const RPL = { once: "1️⃣ တစ်ခါတည်း", daily: "🔁 နေ့တိုင်း", weekly: "🔁 အပတ်တိုင်း" };
 const PERIOD = { daily: 86400e3, weekly: 7 * 86400e3 };
@@ -2299,7 +2306,18 @@ const colorOf = (w) => {
 };
 const onoff = (b) => (b ? "✅" : "⬜");
 const kb = (rows) => ({ keyboard: rows, resize_keyboard: true });
-const mainKb = () => ({ remove_keyboard: true });   // the owner menu lives in the ☰ Menu button next to the text box (see ensureMenu)
+const MKB = { price: "💰 ဈေးနှုန်း", calc: "🧮 Calculator" };
+// Owner's bottom keyboard (private chat): always shown again after a post is finished / cancelled. Taps are handled at the top of postFlow().
+const mainKb = () => ({
+  keyboard: [
+    [{ text: ML.new, style: "primary" }, { text: ML.list, style: "primary" }],
+    [{ text: ML.chn, style: "primary" }, { text: ML.bal, style: "primary" }],
+    [{ text: MKB.price, style: "primary" }, { text: MKB.calc, style: "primary" }],
+    [{ text: ML.help, style: "primary" }],
+  ],
+  resize_keyboard: true,
+  is_persistent: true,
+});
 const NO_KB = mainKb();   // after a post is finished / cancelled the keyboard goes back to the main menu
 const cancelKb = () => kb([[{ text: PL.cancel }]]);
 const backKb = () => kb([[{ text: PL.back }]]);
@@ -2501,6 +2519,8 @@ async function postFlow(env, m) {
   const key = `pst:${uid}`;
   const say = (txt, extra = {}) => send({ ...env, replyTo: 0 }, chat, txt, extra);
   if (t === ML.bal) { await showBalance({ ...env, replyTo: 0 }, chat); return true; }
+  if (t === MKB.price) { await sendPricePicker({ ...env, replyTo: 0 }, chat, await getLang(env, uid)); return true; }
+  if (t === MKB.calc) { await say(CALC_HELP); return true; }
   if (t === ML.help) {   // the same menu /start shows, called from the keyboard; ❌ ပိတ် deletes it
     await junkSweep(env, chat);
     await sendUi({ ...env, replyTo: 0 }, chat, MENU_TEXT, helpRows(true, true));
@@ -3474,18 +3494,17 @@ const CALC_ERR = {
   syntax: "ပုံစံ မမှန်ပါ",
   noans: "ရှေ့က ရလဒ် မရှိသေးပါ",
 };
-const CALC_HELP =
-  "<b>🧮 Calculator</b>\n" +
-  "• <code>5000+3000*2</code>  <code>(15000-2500)/5</code>\n" +
-  "• %: <code>20% of 5000</code>  <code>5000+10%</code>  <code>5000-15%</code>\n" +
-  "• အတိုကောက်: <code>5k*3</code>  <code>2m</code>  <code>2သိန်း 5သောင်း</code>\n" +
-  "• <code>2^10</code>  <code>10!</code>  <code>17 mod 5</code>  <code>sqrt(144)</code>  <code>pi*5^2</code>\n" +
-  "• <code>round(10/3, 2)</code>  <code>min(3,9)</code>  <code>avg(10,20,30)</code>  <code>ans*2</code>\n" +
-  "• ဆိုင်သုံး: <code>disc(50000,10)</code> (လျှော့ပြီး)  <code>vat(50000,5)</code> (တိုးပြီး)\n  <code>pctof(30,200)</code> (၃၀ က ၂၀၀ ရဲ့ ဘယ်နှ %)  <code>pchange(100,125)</code>\n" +
-  "• Unit: <code>5 km to mi</code>  <code>100 f to c</code>  <code>2 viss to kg</code>  <code>1.5 gb to mb</code>\n" +
-  "• စာကြောင်းများများ ရေးရင် တစ်ကြောင်းချင်း တွက်ပြီး စုစုပေါင်း ပေးမယ်\n" +
-  "• Reply လုပ်ပြီး <code>/calc</code> ရိုက်ရင် အဲဒီစာကို တွက်ပေးမယ်\n\n" +
-  "<i>Admin: /set calc auto|cmd|off</i>";
+const CALC_HELP = [
+  "<b>🧮 Calculator</b>",
+  "<blockquote><b>ပုံမှန်</b>\n<code>5000+3000*2</code>  <code>(15000-2500)/5</code></blockquote>",
+  "<blockquote><b>%</b>\n<code>20% of 5000</code>  <code>5000+10%</code>  <code>5000-15%</code></blockquote>",
+  "<blockquote><b>အတိုကောက်</b>\n<code>5k*3</code>  <code>2m</code>  <code>2သိန်း 5သောင်း</code></blockquote>",
+  "<blockquote><b>ဆိုင်သုံး</b>\n<code>disc(50000,10)</code> — လျှော့ပြီး\n<code>vat(50000,5)</code> — တိုးပြီး\n<code>pctof(30,200)</code> · <code>pchange(100,125)</code></blockquote>",
+  "<blockquote><b>အကြွေးပြန်အမ်း · USD</b>\n<code>paid 50000 price 45000</code>\n<code>50 usd to mmk</code> <i>(Admin)</i></blockquote>",
+  "<blockquote><b>Unit</b>\n<code>5 km to mi</code>  <code>100 f to c</code>  <code>2 viss to kg</code></blockquote>",
+  "<blockquote><b>တခြား</b>\n<code>2^10</code>  <code>10!</code>  <code>17 mod 5</code>  <code>sqrt(144)</code>  <code>pi*5^2</code>\n<code>round(10/3, 2)</code>  <code>min(3,9)</code>  <code>avg(10,20,30)</code>  <code>ans*2</code></blockquote>",
+  "<i>စာကြောင်းများများ ရေးရင် တစ်ကြောင်းချင်း တွက်ပြီး စုစုပေါင်း ပေးမယ်\nReply လုပ်ပြီး /calc ရိုက်ရင် အဲဒီစာကို တွက်ပေးမယ်\nAdmin: /set calc auto|cmd|off</i>",
+].join("\n");
 
 // Returns true when the message was answered as a calculation.
 async function calcHandle(env, m, chat, text, isGroup) {
@@ -3582,33 +3601,62 @@ async function calcHandle(env, m, chat, text, isGroup) {
 }
 
 /* ---------- Bot flow ---------- */
-const MENU_TEXT =
-  "<b>🤖 PCA Name Check Bot</b>\n" +
-  "ID + Server ပို့ရင် Name စစ်ပေးမယ်\n<code>123456789(2002)</code>\n" +
-  "ဈေးကြည့်ရန် game အတိုကောက် ရိုက်ပါ — <code>ml</code>\n" +
-  "တွက်ချက်ရန် — <code>5000+3000*2</code> သို့ <code>/calc</code>";
+const MENU_TEXT = [
+  "<b>🤖 PCA Name Check Bot</b>",
+  "<blockquote><b>🔎 Name စစ်</b>\n<code>123456789(2002)</code></blockquote>",
+  "<blockquote><b>💰 ဈေးကြည့်</b>\nGame အတိုကောက် ရိုက်ပါ — <code>ml</code></blockquote>",
+  "<blockquote><b>🧮 တွက်ချက်</b>\n<code>5000+3000*2</code> သို့ <code>/calc</code></blockquote>",
+].join("\n");
 const HELP_PAGES = {
   w: ["📝 Post တင်နည်း", POST_HELP_TEXT],
-  n: ["🔎 Name စစ်နည်း",
-    "<b>🔎 Name စစ်နည်း</b>\n<code>123456789(2002)</code>\nGame နာမည်ပါရင် ပိုမြန်: <code>ml 123456789 2002</code>\nGroup မှာ <b>id</b> ရှေ့ခံ: <code>id 123456789(2002)</code>\nServer မလိုရင် ID ပဲ ပို့: <code>id 123456789</code>\nID နဲ့ Server ကို space ( ) | - , ဘာနဲ့ခြားခြား ရ\nBot မေးတဲ့စာကို reply လုပ်ပြီး ID ပို့လည်း ရ"],
-  g: ["🎮 အတိုကောက်",
-    "<b>🎮 အတိုကောက် · ဈေး · ဝယ်</b>\n• ဈေးကြည့် — <code>ml</code>\n• Name စစ် — <code>ml 123456789 2002</code>\n• ဝယ် (Admin) — <code>ml 123456789 2002 86</code>\n  Wallet လောက်ရင် မစစ်ဘဲ တန်းဝယ်ပေးမယ်၊ <code>ml 123456789 2002 86 wp2</code> (wp2 = wp နှစ်ခု၊ <code>86x3</code> ရ)၊ စုစုပေါင်း ၁၀ ခုထိ\n  Package အတိုကောက်: <code>/pkgs ml</code>\n\nmlbb · ml · pubg · pubgm · codm · cod · ff · sm · hok · hsr · zzz · valo · bs · coc · cr · mcgg\n(Game နာမည်ရဲ့ ရှေ့စာလုံးတွေလည်း ရ၊ ဥပမာ gi)"],
+  n: ["🔎 Name စစ်နည်း", [
+    "<b>🔎 Name စစ်နည်း</b>",
+    "<blockquote><b>ပုံမှန်</b>\n<code>123456789(2002)</code></blockquote>",
+    "<blockquote><b>Game နာမည်ပါရင် ပိုမြန်</b>\n<code>ml 123456789 2002</code></blockquote>",
+    "<blockquote><b>Group မှာ</b> — <b>id</b> ရှေ့ခံ\n<code>id 123456789(2002)</code></blockquote>",
+    "<blockquote><b>Server မလိုတဲ့ game</b>\n<code>id 123456789</code></blockquote>",
+    "<i>ID နဲ့ Server ကို space ( ) | - , ဘာနဲ့ခြားခြား ရတယ်။ Bot မေးတဲ့စာကို reply လုပ်ပြီး ID ပို့လည်း ရတယ်။</i>",
+  ].join("\n")],
+  g: ["🎮 အတိုကောက်", [
+    "<b>🎮 အတိုကောက် · ဈေး · ဝယ်</b>",
+    "<blockquote><b>ဈေးကြည့်</b>\n<code>ml</code></blockquote>",
+    "<blockquote><b>Name စစ်</b>\n<code>ml 123456789 2002</code></blockquote>",
+    "<blockquote><b>Order (Name စစ် + ဈေးစုစုပေါင်း)</b>\n<code>ml 123456789 2002 86 x3</code></blockquote>",
+    "<blockquote><b>ဝယ် (Admin)</b>\n<code>ml 123456789 2002 86 wp2</code>\nwp2 = wp နှစ်ခု · <code>86x3</code> ရ · စုစုပေါင်း ၁၀ ခုထိ\nWallet လောက်ရင် မစစ်ဘဲ တန်းဝယ်ပေးမယ်</blockquote>",
+    "<b>Package အတိုကောက်</b> — <code>/pkgs ml</code>",
+    "<b>Game အတိုကောက်</b>\nmlbb · ml · pubg · pubgm · codm · cod · ff · sm · hok · hsr · zzz · valo · bs · coc · cr · mcgg\n<i>(Game နာမည်ရဲ့ ရှေ့စာလုံးတွေလည်း ရ၊ ဥပမာ gi)</i>",
+  ].join("\n")],
   c: ["🧮 Calculator", CALC_HELP],
-  t: ["✈️ Telegram",
-    "<b>✈️ Telegram (Stars / Premium)</b>\n<code>@username</code>\n(Group မှာ username တစ်ခုတည်း ပို့မှ စစ်မယ်)"],
-  r: ["✅ ရလဒ်",
-    "<b>✅ ရလဒ်</b>\n• ✅ တွေ့ — Game၊ နာမည်၊ ID (Server) + <b>Copy ID</b>၊ <b>Store</b>\n• ❌ <b>Player Not found</b> — ID / Server ပြန်စစ်ပါ\n• ⚠️ <b>busy</b> — Provider ပြဿနာ၊ ခဏနေ ပြန်စမ်းပါ\n• Voucher နဲ့ နာမည်မပြန်တဲ့ game တွေ စစ်လို့မရ"],
-  p: ["📌 Group မှာ",
-    "<b>📌 Group မှာ</b>\n• Card တွေ ၁ နာရီကြာရင် အလိုလို ပျက်မယ်\n• တစ်မိနစ် ၃ ကြိမ်ပဲ စစ်လို့ရ (မူလ)\n• ID မပါတဲ့ စကားပြောကို မပြန်ပါ\n• Private chat က Owner ပဲ သုံးလို့ရ၊ Customer က ဈေး/ID/Order ပဲ"],
-  s: ["📜 စည်းကမ်း",
-    "<b>📜 Group စည်းကမ်း</b> (Admin မထိ)\n❌ Forward · Link · ရိုင်းတဲ့စကား · Spam\n⚠️ ၁-၂ ကြိမ် သတိပေး → ၃ ကြိမ် ၁ နာရီ mute → ၄ ကြိမ် ban (၂၄ နာရီကြာရင် ပျောက်)\n🔒 Captcha ဖွင့်ထားရင် Member အသစ် ၅ မိနစ်အတွင်း ခလုတ်နှိပ်ရ\n💬 FAQ — Admin ထည့်ထားတဲ့အတိုင်း အလိုလို ဖြေမယ်"],
+  t: ["✈️ Telegram", [
+    "<b>✈️ Telegram (Stars / Premium)</b>",
+    "<blockquote><code>@username</code></blockquote>",
+    "<i>Group မှာ username တစ်ခုတည်း ပို့မှ စစ်မယ်</i>",
+  ].join("\n")],
+  r: ["✅ ရလဒ်", [
+    "<b>✅ ရလဒ်</b>",
+    "<blockquote>✅ <b>တွေ့</b> — Game · နာမည် · ID (Server)\n<b>Copy ID</b> · <b>Store</b> ခလုတ်</blockquote>",
+    "<blockquote>❌ <b>Player Not found</b>\nID / Server ပြန်စစ်ပါ</blockquote>",
+    "<blockquote>⚠️ <b>busy</b>\nProvider ပြဿနာ၊ ခဏနေ ပြန်စမ်းပါ</blockquote>",
+    "<i>Voucher နဲ့ နာမည်မပြန်တဲ့ game တွေ စစ်လို့မရ</i>",
+  ].join("\n")],
+  p: ["📌 Group မှာ", [
+    "<b>📌 Group မှာ</b>",
+    "<blockquote>• Card တွေ ၁ နာရီကြာရင် အလိုလို ပျက်မယ်\n• တစ်မိနစ် ၃ ကြိမ်ပဲ စစ်လို့ရ (မူလ)\n• ID မပါတဲ့ စကားပြောကို မပြန်ပါ</blockquote>",
+    "<blockquote><b>Private chat</b>\nOwner ပဲ သုံးလို့ရ၊ Customer က ဈေး / ID / Order ပဲ</blockquote>",
+  ].join("\n")],
+  s: ["📜 စည်းကမ်း", [
+    "<b>📜 Group စည်းကမ်း</b> <i>(Admin မထိ)</i>",
+    "<blockquote>❌ Forward · Link · ရိုင်းတဲ့စကား · Spam</blockquote>",
+    "<blockquote>⚠️ ၁-၂ ကြိမ် သတိပေး\n🔇 ၃ ကြိမ် ၁ နာရီ mute\n⛔ ၄ ကြိမ် ban (၂၄ နာရီကြာရင် ပျောက်)</blockquote>",
+    "<blockquote>🔒 <b>Captcha</b> — Member အသစ် ၅ မိနစ်အတွင်း ခလုတ်နှိပ်ရ\n💬 <b>FAQ</b> — Admin ထည့်ထားတဲ့အတိုင်း အလိုလို ဖြေမယ်</blockquote>",
+  ].join("\n")],
 };
-// Blue (primary) buttons, two per row. h:<page> opens a page, h:0 is the menu, h:a is the admin help (admins only).
+// Blue (primary) buttons, two per row (a normal inline keyboard: every button in a row is the same width).
+// h:<page> opens a page, h:0 is the menu, h:a is the admin help (admins only).
 const helpRows = (admin = false, priv = false) => {
   const b = (k) => ({ text: HELP_PAGES[k][0], data: "h:" + k, style: "primary" });
-  const rows = [[b("n"), b("g")], [b("t"), b("r")], [b("c"), b("p")], [b("s")]];
-  if (admin) { rows.push([{ text: "🛠 Admin", data: "h:a", style: "primary" }, { text: "💰 Balance", data: "bl:x", style: "primary" }]); if (priv) rows.push([b("w")]); }
-  else if (priv) rows.push([b("w")]);
+  const rows = [[b("n"), b("g")], [b("c"), b("t")], [b("r"), b("p")], priv ? [b("s"), b("w")] : [b("s")]];
+  if (admin) rows.push([{ text: "🛠 Admin", data: "h:a", style: "primary" }, { text: "💰 Balance", data: "bl:x", style: "primary" }]);
   if (priv) rows.push([CLOSE_BTN]);
   return rows;
 };
@@ -3622,7 +3670,7 @@ const adminMenu = () => ({ inline_keyboard: toInline(adminRows()) });
    Admin-only commands are untouched: they still need the owner (private) or a group admin. */
 const LANGS = {
   my: {
-    menuBody: "<b>🤖 PCA Name Check Bot</b>\nID + Server ပို့ရင် Name စစ်ပေးမယ်\n<code>123456789(2002)</code>\nဈေးကြည့်ရန် game အတိုကောက် ရိုက်ပါ — <code>ml</code>",
+    menuBody: "<b>🤖 PCA Name Check Bot</b>\n<blockquote><b>🔎 Name စစ်</b>\n<code>123456789(2002)</code></blockquote>\n<blockquote><b>💰 ဈေးကြည့်</b>\nGame အတိုကောက် ရိုက်ပါ — <code>ml</code></blockquote>",
     btnId: "🆔 ကျွန်တော့် ID", btnPrice: "💰 ဈေးနှုန်း", btnOrders: "📦 Order", btnPay: "💳 ငွေလွှဲရန်", btnLang: "🌐 Language", btnStore: "🏪 Store", btnHelp: "ℹ️ အကူအညီ",
     noIds: "🆔 စစ်ထားတဲ့ ID မရှိသေးပါ။",
     idsTitle: "🆔 <b>ကျွန်တော့် ID များ</b>\nနှိပ်ရင် ပြန်စစ်ပေးမယ်", btnClear: "🗑 အကုန်ဖျက်", idsCleared: "🗑 ဖျက်ပြီးပါပြီ",
@@ -3635,7 +3683,7 @@ const LANGS = {
     dupReceipt: "⚠️ <b>ဒီ receipt ပုံ အရင်ပို့ဖူးပါတယ်</b>",
   },
   en: {
-    menuBody: "<b>🤖 PCA Name Check Bot</b>\nSend Player ID + Server ID to check a name\n<code>123456789(2002)</code>\nFor prices type a game short name — <code>ml</code>",
+    menuBody: "<b>🤖 PCA Name Check Bot</b>\n<blockquote><b>🔎 Name check</b>\n<code>123456789(2002)</code></blockquote>\n<blockquote><b>💰 Prices</b>\nType a game short name — <code>ml</code></blockquote>",
     btnId: "🆔 My IDs", btnPrice: "💰 Prices", btnOrders: "📦 Orders", btnPay: "💳 Payment", btnLang: "🌐 Language", btnStore: "🏪 Store", btnHelp: "ℹ️ Help",
     noIds: "🆔 No checked IDs yet.",
     idsTitle: "🆔 <b>My IDs</b>\nTap one to check again", btnClear: "🗑 Clear all", idsCleared: "🗑 Cleared",
@@ -3718,7 +3766,7 @@ async function freshPackages(env, group) {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ structuredQuery: {
-          from: [{ collectionId: "games" }],
+          from: [{ collectionId: GCOLL || "games" }],
           where: { fieldFilter: { field: { fieldPath: "name" }, op: "EQUAL", value: { stringValue: name } } },
           select: { fields: ["name", "serverName", "packages", "g2bulkCode", "packageTabLabels", "packageTabs"].map((fieldPath) => ({ fieldPath })) },
         } }),
@@ -3830,12 +3878,18 @@ async function sendPrice(env, chat, group, lang, tabIdx, mode) {
   const storeBtn = store && /^https:\/\//.test(store) ? [{ text: L(lang, "btnStore"), url: store, style: "primary" }] : [];
   // 1) rich message: table with tap-to-copy short code / price
   if (S.rich !== "off" && !env.bc) {
-    let h = `<h3>💰 ${title}</h3>`;
+    let h = `<p>💰 <b>${title}</b></p>`;
+    // Package cell: <code>short code</code> + the rest of the amount text (the code alone when the amount is just that number).
+    const cell = (p) => {
+      const code = String(pkgShort(group.key, p)), amt = String(p.amount).trim();
+      const rest = amt.toLowerCase().startsWith(code.toLowerCase()) ? amt.slice(code.length).trim() : amt;
+      return `<code>${esc(code)}</code>${rest ? " " + esc(rest) : ""}`;
+    };
     for (const e of es) {
-      if (e.server && es.length > 1) h += `<h4>${esc(e.server)}</h4>`;
-      h += `<table bordered striped compact>${e.packages.map((p) => `<tr><td><code>${esc(pkgShort(group.key, p))}</code></td><td>${esc(String(p.amount))}</td><td align="right"><code>${money(p)}</code> Ks</td>${srate ? `<td align="right">${costUsd(p)} USD</td><td align="right">${costKs(p)} Ks</td>` : ""}</tr>`).join("")}</table>`;
+      if (e.server && es.length > 1) h += `<p><b>${esc(e.server)}</b></p>`;
+      h += `<table compact>${e.packages.map((p) => `<tr><td>${cell(p)}</td><td align="right"><code>${money(p)}</code> Ks</td>${srate ? `<td align="right">${costKs(p)} · ${costUsd(p)}$</td>` : ""}</tr>`).join("")}</table>`;
     }
-    if (srate) h += `<p>Price Ks | Cost USD | Cost Ks (USD rate ${srate})</p>`;
+    if (srate) h += `<p><i>Cost = Ks · USD (rate ${srate})</i></p>`;
     h += `<p><i>${esc(L(lang, "priceNote"))}</i></p>`;
     const btns = [[{ text: "Copy", data: `px:y:${group.id}:${tabIdx === undefined ? "" : tabIdx}`, style: "primary" }, closeBtn(env)]];
     if (storeBtn.length) btns.push(storeBtn);
@@ -3847,7 +3901,7 @@ async function sendPrice(env, chat, group, lang, tabIdx, mode) {
   const plainLines = [];
   for (const e of es) {
     out += e.server && es.length > 1 ? `\n<b>${esc(e.server)}</b>\n` : "\n";
-    out += e.packages.map((p) => `<code>${esc(pkgShort(group.key, p))}</code> · ${esc(String(p.amount))} — <code>${money(p)}</code> Ks${srate ? ` · ${costUsd(p)} USD · ${costKs(p)} Ks` : ""}`).join("\n") + "\n";
+    out += e.packages.map((p) => `<code>${esc(pkgShort(group.key, p))}</code> · ${esc(String(p.amount))} — <code>${money(p)}</code> Ks${srate ? ` · cost ${costKs(p)} (${costUsd(p)}$)` : ""}`).join("\n") + "\n";
     e.packages.forEach((p) => plainLines.push(`${p.amount} - ${money(p)} Ks`));
   }
   out += `\n<i>${L(lang, "priceNote")}</i>`;
@@ -4191,13 +4245,8 @@ async function priceWatch(env) {
   if (rows.length > 60) {   // a rate change rescales every cost: one summary line instead of hundreds of rows
     lines.push(`<b>${rows.length}</b> package ရဲ့ Price / Cost ပြောင်းသွားပါတယ်`);
   } else if (rows.length) {
-    const head = ["Game", "Package", "Price", "Cost"];
-    const body = rows.slice(0, 30).map((r) => [r[0], r[1], r[4] ? `New ${r[3]}` : r[2], r[4] ? r[4] : r[3]]);
-    const all = [head, ...body];
-    const w = head.map((_, c) => Math.max(...all.map((r) => vlen(String(r[c])))));
-    const fit = (v, n) => String(v) + " ".repeat(Math.max(0, n - vlen(String(v))));
-    const fmt = (r) => r.map((v, c) => (c === head.length - 1 ? String(v) : fit(v, w[c]))).join("  ");
-    lines.push(`<pre>${esc([fmt(head), "-".repeat(w.reduce((x, y) => x + y, 0) + 6), ...body.map(fmt)].join("\n"))}</pre>`);
+    const ln = rows.slice(0, 30).map((r) => `• <b>${esc(r[0])}</b> <code>${esc(r[1])}</code> — ${r[4] ? `New ${esc(r[3])}` : esc(r[2])} · cost ${esc(r[4] ? r[4] : r[3])}`);
+    lines.push(ln.join("\n"));
     if (rows.length > 30) lines.push(`နောက်ထပ် ${rows.length - 30} ခု`);
   }
   await notifyOwners(env, `<b>Price update</b>\n` + lines.join("\n"));
@@ -4249,9 +4298,9 @@ async function showBalance(env, chat) {
   const bal = await g2Balance(env);
   if (bal === null) return sendCard(env, chat, "Balance မဖတ်နိုင်ပါ၊ ခဏနေ ပြန်စမ်းပါ", {}, 60 * 1000);
   const rate = await storeRate(env);
-  const rows = [["Wallet (USD)", bal.toFixed(2)]];
-  if (rate) rows.push(["USD rate (Admin panel)", String(rate)], ["Wallet (Ks)", Math.round(bal * rate).toLocaleString("en-US")]);
-  return showTable(env, chat, buyTable("G2Bulk Wallet", ["", "Amount"], rows, [1], rate ? "" : esc(NO_RATE)), 2 * 60 * 1000);
+  const lines = ["<b>💰 G2Bulk Wallet</b>", `<blockquote><b>${bal.toFixed(2)} USD</b>${rate ? ` · ${Math.round(bal * rate).toLocaleString("en-US")} Ks\nRate ${rate}` : ""}</blockquote>`];
+  if (!rate) lines.push(esc(NO_RATE));
+  return sendCard(env, chat, lines.join("\n"), {}, 2 * 60 * 1000);
 }
 // /health (owner): one screen with everything that can break.
 async function showHealth(env, chat) {
@@ -4286,7 +4335,7 @@ async function showHealth(env, chat) {
 function buyTable(title, head, rows, right, foot) {
   const al = (c) => (right.includes(c) ? ' align="right"' : "");
   const rich =
-    `<h3>${esc(title)}</h3><table bordered striped compact><tr>${head.map((h, c) => `<td${al(c)}><b>${esc(h)}</b></td>`).join("")}</tr>` +
+    `<p><b>${esc(title)}</b></p><table compact><tr>${head.map((h, c) => `<td${al(c)}><b>${esc(h)}</b></td>`).join("")}</tr>` +
     rows.map((r) => `<tr>${r.map((v, c) => `<td${al(c)}>${c === 0 ? `<code>${esc(v)}</code>` : esc(v)}</td>`).join("")}</tr>`).join("") +
     `</table>` + (foot ? `<p>${foot}</p>` : "");
   const all = [head, ...rows].map((r) => r.map(String));
@@ -4543,9 +4592,9 @@ async function handle(u, env) {
   // "List" / "list." / "/list": every game as a button, tap one = its price list (Copy + Close under it)
   if (/^\/?lists?[\s.!။]*$/i.test(text)) return sendPricePicker(env, chat, await getLang(env, m.from?.id));
   if (/^\/(start|help)(@\w+)?(\s|$)/i.test(text)) {
-    if (isPrivate && env.STATE && owners.includes(String(m.from?.id)) && !(await env.STATE.get("kbrm:" + m.from.id).catch(() => null))) {   // once: take the old bottom keyboard away
-      await env.STATE.put("kbrm:" + m.from.id, "1").catch(() => {});
-      await send({ ...env, replyTo: 0 }, chat, "☰ Menu ခလုတ် (စာရိုက်တဲ့ဘေး) ထဲက command တွေကို သုံးပါ", { reply_markup: { remove_keyboard: true } });
+    if (isPrivate && env.STATE && owners.includes(String(m.from?.id)) && !(await env.STATE.get("kbon:" + m.from.id).catch(() => null))) {   // bottom keyboard: sent once, it stays until removed
+      await env.STATE.put("kbon:" + m.from.id, "1", { expirationTtl: 7 * 86400 }).catch(() => {});
+      await send({ ...env, replyTo: 0 }, chat, "⌨️ <b>Menu keyboard</b> ဖွင့်ပြီးပါပြီ", { reply_markup: mainKb() });
     }
     const isAdm = owners.includes(String(m.from?.id)) || (isGroup && (await isAdmin(env, chat, m.from?.id)));   // the Admin button is shown to admins only
     return sendUi(env, chat, MENU_TEXT, helpRows(isAdm, isPrivate), 10 * 60 * 1000);
